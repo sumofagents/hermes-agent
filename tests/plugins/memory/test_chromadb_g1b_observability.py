@@ -183,6 +183,21 @@ def test_feedback_ledger_append_read_and_partial_line_tolerance(tmp_path):
     assert summary["labels"] == {"you_know_this": 1}
 
 
+def test_missing_feedback_ledger_summary_reports_missing_without_creating_file(tmp_path):
+    from plugins.memory.chromadb.g1b_observability import iter_feedback_events, summarize_feedback_events
+
+    path = tmp_path / "logs" / "memory_feedback.jsonl"
+
+    events = iter_feedback_events(path)
+    summary = summarize_feedback_events(events)
+
+    assert events == []
+    assert summary["event_count"] == 0
+    assert summary["malformed_count"] == 0
+    assert summary["missing"] is True
+    assert not path.exists()
+
+
 def test_feedback_events_from_boot_receipt_selected_and_dropped_real_g1a_shape():
     from plugins.memory.chromadb.g1b_observability import feedback_events_from_boot_receipt
 
