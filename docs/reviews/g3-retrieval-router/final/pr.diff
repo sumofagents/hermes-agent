@@ -1,0 +1,1206 @@
+diff --git a/agent/retrieval_router.py b/agent/retrieval_router.py
+new file mode 100644
+index 000000000..a27f39d79
+--- /dev/null
++++ b/agent/retrieval_router.py
+@@ -0,0 +1,504 @@
++"""Goal 3 deterministic retrieval planner and context renderer.
++
++Pure helpers only: no ChromaDB, network, config, or filesystem imports. The
++runtime can use these helpers before the first LLM call to decide which
++read-only retrieval routes are eligible for a turn. Safety-critical decisions
++stay deterministic; optional LLM refinement may only narrow/reorder/rewrite
++queries for routes already allowed by this planner.
++"""
++from __future__ import annotations
++
++import ipaddress
++import re
++from dataclasses import dataclass, replace
++from enum import Enum
++from typing import Any, Iterable
++from urllib.parse import parse_qsl, urlparse
++
++from agent.recall_gate import RiskResult, build_queries, classify_risk, sanitize_for_query
++
++
++class ComplexityTier(str, Enum):
++    NONE = "none"
++    SIMPLE = "simple"
++    STANDARD = "standard"
++    COMPLEX = "complex"
++
++
++class RouteKind(str, Enum):
++    MEMORY_SEMANTIC = "memory_semantic"
++    SESSION_SEMANTIC = "session_semantic"
++    SESSION_FTS = "session_fts"
++    WEB_SEARCH = "web_search"
++    WEB_EXTRACT = "web_extract"
++    FILE_SEARCH = "file_search"
++    FILE_READ = "file_read"
++    TOOL_RECALL = "tool_recall"
++
++
++@dataclass(frozen=True)
++class RetrievalRoute:
++    kind: RouteKind
++    queries: tuple[str, ...]
++    mandatory: bool = False
++    read_only: bool = True
++    private_query: bool = True
++    char_budget: int = 1200
++    timeout_ms: int = 1500
++    reason: str = ""
++
++
++@dataclass(frozen=True)
++class RetrievalPlan:
++    enabled: bool
++    mandatory: bool
++    labels: tuple[str, ...]
++    risk: RiskResult
++    complexity_tier: ComplexityTier
++    routes: tuple[RetrievalRoute, ...]
++    char_budget: int = 3500
++    latency_budget_ms: int = 5000
++    reason: str = ""
++
++
++_URL_RE = re.compile(r"https?://[^\s)>\"']+", re.I)
++_CURRENT_PUBLIC_RE = re.compile(
++    r"\b(latest|current|today|news|recent|now|price|weather|who\s+won|standings|public)\b",
++    re.I,
++)
++_FILE_RE = re.compile(
++    r"\b(this\s+repo|repository|codebase|file|files|path|search\s+(?:this\s+)?repo|read\s+file|open\s+file)\b",
++    re.I,
++)
++_SECRETISH_FILE_RE = re.compile(
++    r"(^|[=/])("
++    r"\.env(?:\..*)?|\.npmrc(?:\..*)?|credentials(?:\..*)?|id_rsa(?:\..*)?|id_ed25519(?:\..*)?|"
++    r"[^\s/]*(?:secret|token|api[_-]?key|access[_-]?key|password|passwd|pwd)[^\s/]*"
++    r")$",
++    re.I,
++)
++_SECRETISH_URL_RE = re.compile(
++    r"\b(token|secret|api[_-]?key|access[_-]?key|password|passwd|pwd|auth|session|bearer|"
++    r"jeremiah|profile|medical|diagnosis|health|private|personal|resume|application)\b",
++    re.I,
++)
++_PRIVATE_WEB_BLOCK_RE = re.compile(
++    r"\b(my|mine|about\s+me|jeremiah|medical|diagnosis|health|doctor|therapy|ssn|social\s+security|"
++    r"password|token|secret|api\s*key|private|personal|profile|resume|application|job|role|applied|"
++    r"address|phone|email|family|legal|bank|credit|income|salary)\b",
++    re.I,
++)
++_SPACE = re.compile(r"\s+")
++_NUMERICISH_HOST_RE = re.compile(
++    r"^(?:0x[0-9a-f]+|[0-9a-f]+)(?:\.(?:0x[0-9a-f]+|[0-9a-f]+))*$",
++    re.I,
++)
++_SECRET_NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
++_SECRET_URL_TOKENS = (
++    "token",
++    "secret",
++    "apikey",
++    "accesskey",
++    "password",
++    "passwd",
++    "pwd",
++    "auth",
++    "session",
++    "bearer",
++)
++_SECRET_FILE_EXACT = {".env", ".npmrc", "credentials", "id_rsa", "id_ed25519"}
++
++
++def _dedup(items: Iterable[str], *, limit: int = 6) -> tuple[str, ...]:
++    out: list[str] = []
++    for item in items:
++        cleaned = sanitize_for_query(str(item or ""))
++        if cleaned and cleaned not in out:
++            out.append(cleaned)
++        if len(out) >= limit:
++            break
++    return tuple(out)
++
++
++def _route_kinds(routes: Iterable[RetrievalRoute]) -> set[RouteKind]:
++    return {route.kind for route in routes}
++
++
++def _complexity_for(message: str, risk: RiskResult, route_count: int) -> ComplexityTier:
++    if risk.mandatory:
++        if len(risk.risk_classes) > 1 or route_count >= 3:
++            return ComplexityTier.COMPLEX
++        return ComplexityTier.STANDARD
++    text = sanitize_for_query(message)
++    if not route_count:
++        return ComplexityTier.NONE
++    if len(text) < 120 and route_count == 1:
++        return ComplexityTier.SIMPLE
++    return ComplexityTier.STANDARD
++
++
++def _message_without_urls(message: str) -> str:
++    return _URL_RE.sub(" ", message or "")
++
++
++def _secret_keyish(value: str) -> bool:
++    normalized = _SECRET_NORMALIZE_RE.sub("", (value or "").lower())
++    return any(token in normalized for token in _SECRET_URL_TOKENS)
++
++
++def _public_web_allowed(message: str, risk: RiskResult) -> bool:
++    text = sanitize_for_query(_message_without_urls(message))
++    if risk.mandatory:
++        return False
++    if _FILE_RE.search(text):
++        return False
++    if _PRIVATE_WEB_BLOCK_RE.search(text):
++        return False
++    return bool(_CURRENT_PUBLIC_RE.search(text))
++
++
++def _public_url_extract_allowed(message: str, risk: RiskResult) -> bool:
++    text = sanitize_for_query(_message_without_urls(message))
++    if risk.mandatory:
++        return False
++    if _FILE_RE.search(text):
++        return False
++    if _PRIVATE_WEB_BLOCK_RE.search(text):
++        return False
++    return True
++
++
++def _strip_token_punctuation(token: str) -> str:
++    # Preserve leading dots for dotfiles such as .env while removing trailing
++    # sentence punctuation that users often include in natural-language prompts.
++    return token.strip("()[]{}<>\"'").rstrip(".,;:!?")
++
++
++def _host_is_public(hostname: str | None) -> bool:
++    if not hostname:
++        return False
++    host = hostname.strip().lower().rstrip(".")
++    if not host or host == "localhost" or host.endswith(".local"):
++        return False
++    try:
++        ip = ipaddress.ip_address(host)
++    except ValueError:
++        # Numeric-looking hostnames can be accepted by platform resolvers as
++        # alternate IPv4 spellings (for example 2130706433 or 127.1 -> loopback).
++        # They are never needed for Phase A public web descriptors, so fail closed.
++        if _NUMERICISH_HOST_RE.fullmatch(host):
++            return False
++        return True
++    return ip.is_global and not (
++        ip.is_private
++        or ip.is_loopback
++        or ip.is_link_local
++        or ip.is_reserved
++        or ip.is_multicast
++        or ip.is_unspecified
++        or bool(getattr(ip, "is_site_local", False))
++    )
++
++
++def _url_is_public(url: str) -> bool:
++    text = sanitize_for_query(url)
++    if not _URL_RE.fullmatch(text):
++        return False
++    try:
++        parsed = urlparse(text)
++    except ValueError:
++        return False
++    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
++        return False
++    if parsed.username or parsed.password:
++        return False
++    if not _host_is_public(parsed.hostname):
++        return False
++    haystack = " ".join(
++        part
++        for part in [parsed.netloc, parsed.path, parsed.fragment]
++        if part
++    )
++    if _SECRETISH_URL_RE.search(haystack):
++        return False
++    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
++        if _SECRETISH_URL_RE.search(key) or _SECRETISH_URL_RE.search(value):
++            return False
++        if _secret_keyish(key) or _secret_keyish(value):
++            return False
++    return True
++
++
++def _web_query_is_public(query: str) -> bool:
++    text = sanitize_for_query(query)
++    if not text or _PRIVATE_WEB_BLOCK_RE.search(text) or _FILE_RE.search(text):
++        return False
++    if _URL_RE.fullmatch(text):
++        return _url_is_public(text)
++    return True
++
++
++def _extract_urls(message: str) -> tuple[str, ...]:
++    return tuple(dict.fromkeys(_URL_RE.findall(message or "")))
++
++
++def _file_token_is_secret(token: str) -> bool:
++    normalized = _strip_token_punctuation(token)
++    parts = [part for chunk in normalized.split("=") for part in chunk.split("/") if part]
++    for part in parts:
++        lowered = part.lower()
++        if lowered in _SECRET_FILE_EXACT or lowered.startswith(".env."):
++            return True
++        if _SECRETISH_FILE_RE.search(lowered):
++            return True
++        if _secret_keyish(lowered):
++            return True
++    return False
++
++
++def _file_query(message: str) -> str:
++    text = sanitize_for_query(message)
++    # Keep this conservative: route descriptor only, no filesystem access here.
++    for token in text.split():
++        if _file_token_is_secret(token):
++            return ""
++    return text
++
++
++def _file_queries_are_safe(queries: Iterable[str]) -> bool:
++    return all(bool(_file_query(query)) for query in queries)
++
++
++def build_deterministic_plan(
++    message: str,
++    *,
++    enabled: bool = True,
++    char_budget: int = 3500,
++    latency_budget_ms: int = 5000,
++) -> RetrievalPlan:
++    """Build a deterministic, read-only retrieval plan for a user turn.
++
++    G2 mandatory memory recall remains the floor. G3 can add session/file/web
++    route descriptors, but private/profile/job/continuity classes never route to
++    web and all produced routes are read-only.
++    """
++    risk = classify_risk(message)
++    if not enabled:
++        return RetrievalPlan(
++            enabled=False,
++            mandatory=False,
++            labels=(),
++            risk=risk,
++            complexity_tier=ComplexityTier.NONE,
++            routes=(),
++            char_budget=char_budget,
++            latency_budget_ms=latency_budget_ms,
++            reason="disabled",
++        )
++
++    routes: list[RetrievalRoute] = []
++    memory_queries = _dedup(build_queries(message, risk))
++    if risk.mandatory and memory_queries:
++        routes.extend(
++            [
++                RetrievalRoute(
++                    kind=RouteKind.MEMORY_SEMANTIC,
++                    queries=memory_queries,
++                    mandatory=True,
++                    private_query=True,
++                    reason="g2_mandatory_memory",
++                ),
++                RetrievalRoute(
++                    kind=RouteKind.SESSION_SEMANTIC,
++                    queries=memory_queries,
++                    mandatory=True,
++                    private_query=True,
++                    reason="g2_mandatory_session_semantic",
++                ),
++                RetrievalRoute(
++                    kind=RouteKind.SESSION_FTS,
++                    queries=memory_queries[:2],
++                    mandatory=True,
++                    private_query=True,
++                    reason="g2_mandatory_session_fts",
++                ),
++            ]
++        )
++
++    raw_urls = _extract_urls(message)
++    urls = tuple(url for url in raw_urls if _url_is_public(url))
++    has_rejected_urls = bool(raw_urls) and len(urls) != len(raw_urls)
++    if urls and _public_url_extract_allowed(message, risk):
++        routes.append(
++            RetrievalRoute(
++                kind=RouteKind.WEB_EXTRACT,
++                queries=urls,
++                mandatory=False,
++                private_query=False,
++                reason="explicit_public_url",
++            )
++        )
++    elif not has_rejected_urls and _public_web_allowed(message, risk):
++        routes.append(
++            RetrievalRoute(
++                kind=RouteKind.WEB_SEARCH,
++                queries=_dedup([message], limit=1),
++                mandatory=False,
++                private_query=False,
++                reason="current_public_fact",
++            )
++        )
++
++    file_text = sanitize_for_query(_message_without_urls(message))
++    if not risk.mandatory and _FILE_RE.search(file_text):
++        query = _file_query(message)
++        if query:
++            kind = RouteKind.FILE_READ if "read file" in query.lower() or "open file" in query.lower() else RouteKind.FILE_SEARCH
++            routes.append(
++                RetrievalRoute(
++                    kind=kind,
++                    queries=(query,),
++                    mandatory=False,
++                    private_query=True,
++                    reason="explicit_local_file_context",
++                )
++            )
++
++    # Deterministic de-dupe by route kind. First route wins so URL extraction
++    # stays more specific than generic public web search.
++    deduped: list[RetrievalRoute] = []
++    seen: set[RouteKind] = set()
++    for route in routes:
++        if route.kind not in seen and route.queries:
++            seen.add(route.kind)
++            deduped.append(route)
++
++    reason = "planned" if deduped else "no_retrieval_needed"
++    return RetrievalPlan(
++        enabled=True,
++        mandatory=risk.mandatory,
++        labels=risk.labels,
++        risk=risk,
++        complexity_tier=_complexity_for(message, risk, len(deduped)),
++        routes=tuple(deduped),
++        char_budget=char_budget,
++        latency_budget_ms=latency_budget_ms,
++        reason=reason,
++    )
++
++
++def merge_llm_refinement(plan: RetrievalPlan, refinement: dict[str, Any] | None) -> RetrievalPlan:
++    """Merge schema-validated LLM refinements without granting authority.
++
++    The LLM may only rewrite queries for route kinds already allowed by the
++    deterministic plan. It cannot add a route, make a route public/private in a
++    looser direction, raise budgets, or lower mandatory recall obligations.
++    """
++    if not isinstance(refinement, dict) or not plan.routes:
++        return plan
++
++    allowed = {route.kind for route in plan.routes}
++    by_kind = {route.kind: route for route in plan.routes}
++    merged: list[RetrievalRoute] = list(plan.routes)
++
++    for raw in refinement.get("routes") or []:
++        if not isinstance(raw, dict):
++            continue
++        try:
++            kind = RouteKind(str(raw.get("kind") or ""))
++        except ValueError:
++            continue
++        if kind not in allowed:
++            continue
++        route = by_kind[kind]
++        queries = _dedup(raw.get("queries") or (), limit=len(route.queries) or 1)
++        if not queries:
++            continue
++        if kind == RouteKind.WEB_SEARCH and not all(_web_query_is_public(q) and not _URL_RE.fullmatch(q) for q in queries):
++            continue
++        if kind == RouteKind.WEB_EXTRACT and not all(_url_is_public(q) for q in queries):
++            continue
++        if kind in {RouteKind.FILE_SEARCH, RouteKind.FILE_READ} and not _file_queries_are_safe(queries):
++            continue
++        replacement = replace(route, queries=queries)
++        merged = [replacement if item.kind == kind else item for item in merged]
++        by_kind[kind] = replacement
++
++    # Optional reordering, constrained to existing route kinds only.
++    order: list[RouteKind] = []
++    for raw_kind in refinement.get("route_order") or []:
++        try:
++            kind = RouteKind(str(raw_kind))
++        except ValueError:
++            continue
++        if kind in allowed and kind not in order:
++            order.append(kind)
++    if order:
++        ordered = [by_kind[kind] for kind in order]
++        ordered.extend(route for route in merged if route.kind not in set(order))
++        merged = ordered
++
++    return replace(plan, routes=tuple(merged))
++
++
++def _normalize_content(content: str) -> str:
++    return _SPACE.sub(" ", (content or "").strip().lower())
++
++
++def _snippet(content: str, max_chars: int = 500) -> str:
++    text = _SPACE.sub(" ", (content or "").strip())
++    if len(text) <= max_chars:
++        return text
++    return text[: max_chars - 1].rstrip() + "…"
++
++
++def render_route_context(results: Iterable[dict[str, Any]], *, char_budget: int = 3500) -> str:
++    """Render route results into a bounded ephemeral context block.
++
++    Input shape is intentionally generic so executors can adapt memory/session,
++    file, web, or tool results without coupling this pure module to those tools.
++    """
++    seen: set[str] = set()
++    rows: list[dict[str, Any]] = []
++    for result in results:
++        content = str(result.get("content") or "") if isinstance(result, dict) else ""
++        key = _normalize_content(content)
++        if not key or key in seen:
++            continue
++        seen.add(key)
++        rows.append(result)
++
++    def build(selected: list[dict[str, Any]], *, compact: bool = False) -> str:
++        if compact:
++            lines = ["## Unified Retrieval Context", "Sources:"]
++        else:
++            lines = [
++                "## Unified Retrieval Context",
++                "Instruction: Use this retrieved context before asking the user to repeat information. If a needed value is not present, ask only for the missing value and say what was already found.",
++                "",
++                "Sources:",
++            ]
++        for result in selected:
++            route = str(result.get("route") or "unknown")
++            fact_id = str(result.get("id") or "")
++            score = float(result.get("score", 0.0) or 0.0)
++            if compact:
++                lines.append(f"- [{route}:{fact_id}] {score:.3f} {_snippet(str(result.get('content') or ''), 80)}")
++            else:
++                lines.append(f"- [{route}:{fact_id}] score={score:.3f}")
++                lines.append(f"  {_snippet(str(result.get('content') or ''), 240)}")
++        return "\n".join(lines).strip()
++
++    selected = rows[:]
++    block = build(selected)
++    compact = False
++    while len(block) > char_budget and selected:
++        if not compact:
++            compact = True
++            block = build(selected, compact=True)
++            continue
++        selected.pop()
++        block = build(selected, compact=True)
++    if len(block) > char_budget:
++        return block[:char_budget]
++    return block
+diff --git a/docs/memory/G3_CONTRACT.md b/docs/memory/G3_CONTRACT.md
+new file mode 100644
+index 000000000..96a3b1aac
+--- /dev/null
++++ b/docs/memory/G3_CONTRACT.md
+@@ -0,0 +1,112 @@
++# G3 contract — unified retrieval routing
++
++## Goal
++
++Goal 3 adds a deterministic unified retrieval planner for current-turn context routing. It preserves the G2 high-risk semantic recall guarantee while making route decisions explicit and testable for memory, session, web, file, and tool recall classes.
++
++This first implementation is the dual-lane-converged Phase A: pure planner, route descriptors, privacy guards, LLM-refinement merge guard, config kill switch, and bounded rendering. It does not enable autonomous web/file/tool execution before a later privacy/latency review.
++
++## Scope guard
++
++In scope:
++
++- MacBook Rilo only.
++- Repository: `/Users/jeremiah/.hermes/hermes-agent/`.
++- Runtime config path: `/Users/jeremiah/.hermes/config.yaml` if local enablement is needed.
++- Read-only ChromaDB/Sentinel and no-mutation Forge embedding usage inherited from G2.
++
++Out of scope:
++
++- ChromaDB writes, schema changes, service restarts, deletions, supersession, or cleanup.
++- Forge writes, model deployment, or service restarts.
++- Writes to `MEMORY.md` or `USER.md`.
++- Changes to `memory_tool` write semantics or builtin mirror behavior.
++- Default-on web/file/tool execution.
++- Deployment to any other Hermes instance.
++
++## Architecture decision
++
++G3 is a planner/router layer, not a replacement for G2.
++
++- `agent.retrieval_router` owns pure deterministic route planning, route descriptors, LLM-refinement merge safety, and bounded context rendering.
++- `agent.recall_gate` remains the source of truth for mandatory high-risk memory recall classes.
++- G2 `MemoryManager.enforced_recall()` and provider implementations remain the live memory execution path for Phase A.
++- Route descriptors cover `memory_semantic`, `session_semantic`, `session_fts`, `web_search`, `web_extract`, `file_search`, `file_read`, and `tool_recall`.
++- Web/file/tool route execution is explicitly deferred; descriptors are allowed only so later executors can be contract-checked against deterministic safety decisions.
++
++## Deterministic vs LLM boundary
++
++Deterministic code owns all safety-critical decisions:
++
++- whether mandatory recall is required;
++- which route kinds are allowed;
++- private/public query classification;
++- web exclusion for private/profile/job/continuity prompts;
++- file route read-only scope;
++- budgets and fail-open behavior.
++
++An LLM planner/refinement may only rewrite or reorder queries for route kinds already present in the deterministic plan. It cannot add route kinds, raise budgets, lower mandatory recall, enable web for private prompts, or request writes. Invalid refinements are ignored.
++
++Default: `memory.retrieval_routing.llm_planner_enabled: false`.
++
++## Config and rollback
++
++Defaults:
++
++```yaml
++memory:
++  retrieval_routing_enabled: true
++  retrieval_routing:
++    llm_planner_enabled: false
++    char_budget: 3500
++    latency_budget_ms: 5000
++```
++
++Rollback:
++
++```bash
++hermes config set memory.retrieval_routing_enabled false
++```
++
++This returns the runtime to the pre-G3 G2 recall path. Full G2 rollback remains:
++
++```bash
++hermes config set memory.first_turn_recall_enabled false
++```
++
++## Expected behavior assertions
++
++Tests must prove:
++
++1. Anduril/SpaceX application reuse plans mandatory memory and session routes and does not plan web.
++2. Continuity-only prompts plan mandatory memory and session routes.
++3. Current/public prompts can plan public web search without private memory routes.
++4. Explicit URL prompts can plan web extraction.
++5. Explicit repo/file prompts can plan read-only local file descriptors.
++6. Arithmetic/generic prompts plan no routes.
++7. Private/profile/job prompts never plan web even when the message contains freshness words.
++8. LLM refinement cannot introduce unknown/disallowed routes or raise budgets.
++9. Bounded rendering deduplicates repeated content and respects the budget.
++10. Config defaults expose `memory.retrieval_routing_enabled` and keep LLM planning off by default.
++11. Runtime initialization reads the G3 config without changing G2 semantics.
++
++## Non-claims / deferred
++
++- No default-on web/file/tool execution.
++- No dynamic salience retuning from G1B feedback yet.
++- No dashboard, stale-fact cleanup, Chroma writes, or schema changes.
++- No guarantee that a planned descriptor was executed unless a later executor receipt says so.
++
++## Pivot conditions
++
++Re-open the contract if:
++
++- Route planning cannot remain pure and deterministic.
++- Web/file/tool execution is required in the same PR.
++- Privacy review finds private facts can leak into public web queries.
++- Runtime latency exceeds the G2 5s budget once executors are added.
++- Implementation requires Chroma writes, schema changes, remote service restarts, or memory write semantics changes.
++
++## Dual-lane reconciliation
++
++Codex GPT-5.5 approved a broader full router plan. Claude Opus 4.7 approved only a safer Phase A and objected to shipping web/file/tool execution in the first patch due to privacy and latency risk. This contract adopts the converged subset: route descriptors and guards now, execution later under a separate gate.
+diff --git a/docs/memory/G3_STATUS.md b/docs/memory/G3_STATUS.md
+new file mode 100644
+index 000000000..dff393a4f
+--- /dev/null
++++ b/docs/memory/G3_STATUS.md
+@@ -0,0 +1,72 @@
++# G3 status — unified retrieval routing
++
++## Built in this implementation branch
++
++- Added `agent/retrieval_router.py`, a pure deterministic Goal 3 planner/router helper module.
++- Added route descriptors for:
++  - `memory_semantic`
++  - `session_semantic`
++  - `session_fts`
++  - `web_search`
++  - `web_extract`
++  - `file_search`
++  - `file_read`
++  - `tool_recall`
++- Preserved G2 as the mandatory high-risk recall floor by reusing `agent.recall_gate.classify_risk()` and `build_queries()`.
++- Added privacy guards:
++  - job/application, continuity, and personal/profile classes do not plan web routes;
++  - all planned routes are read-only descriptors;
++  - file route descriptors are local/private and deny obvious secret-file requests at the planning layer.
++- Added `merge_llm_refinement()` with deterministic authority boundaries: LLM refinement can only rewrite/reorder queries for already-allowed route kinds and cannot add web/file/tool routes or raise budgets.
++- Added bounded `render_route_context()` with normalized-content deduplication.
++- Added config defaults:
++  - `memory.retrieval_routing_enabled: true`
++  - `memory.retrieval_routing.llm_planner_enabled: false`
++  - `memory.retrieval_routing.char_budget: 3500`
++  - `memory.retrieval_routing.latency_budget_ms: 5000`
++- Wired `run_agent.py` initialization to read and store the G3 config without changing the existing G2 execution path.
++
++## Deferred
++
++- Default-on web/file/tool execution.
++- LLM planner calls before the first LLM response.
++- Cross-tool execution receipts.
++- Dynamic salience tuning from G1B access counters/correction feedback.
++- Stale-fact cleanup, duplicate review queues, Chroma deletion/supersession, and dashboards.
++
++## Safety and rollback
++
++G3 Phase A is additive and pure. It does not write to ChromaDB, Sentinel, Forge, `MEMORY.md`, or `USER.md`.
++
++Rollback:
++
++```bash
++hermes config set memory.retrieval_routing_enabled false
++```
++
++Full G2 recall rollback remains:
++
++```bash
++hermes config set memory.first_turn_recall_enabled false
++```
++
++## Verification
++
++Focused G3 TDD command:
++
++```bash
++uv run --with pytest python -m pytest -o addopts='' -q tests/agent/test_retrieval_router.py
++```
++
++Initial RED:
++
++- failed with `ModuleNotFoundError: No module named 'agent.retrieval_router'`.
++
++GREEN:
++
++- Initial planner/router implementation: `9 passed`.
++- After final-review privacy hardening for non-G2 private freshness prompts, private/token/profile URLs, credential URL keys, URL userinfo credentials, internal/private/link-local/non-global/special-use URL targets including alternate and mixed-radix numeric loopback, multicast/site-local, and bracketed IPv6 forms, public URLs with file/path terms, secret-file path variants, FILE_READ positive coverage, private job-relationship phrases, and file-route LLM refinement: `22 passed`.
++
++## Controller-review decisions
++
++The dual planning lanes disagreed on scope breadth. Codex approved full unified routing. Claude approved only a Phase A subset and requested web/file/tool execution be deferred. The controller adopted the converged safe subset to preserve dual-lane concurrence rather than overriding the privacy/latency objection.
+diff --git a/docs/reviews/g3-retrieval-router/README.md b/docs/reviews/g3-retrieval-router/README.md
+new file mode 100644
+index 000000000..654666df8
+--- /dev/null
++++ b/docs/reviews/g3-retrieval-router/README.md
+@@ -0,0 +1,8 @@
++# G3 retrieval router review custody
++
++This directory contains the independent planning/review receipts for Goal 3 unified retrieval routing.
++
++- `codex_plan_review.md` — Codex GPT-5.5 planning lane, APPROVED_PLAN for broad unified routing.
++- `claude_plan_review.md` — Claude Opus 4.7 planning lane, APPROVED_PLAN for Phase A only with web/file/tool execution deferred.
++
++Controller reconciliation: implement the dual-lane-converged Phase A now (pure deterministic planner, descriptors, guards, config, tests) and defer default-on web/file/tool execution to a later privacy/latency gate.
+diff --git a/docs/reviews/g3-retrieval-router/claude_plan_review.md b/docs/reviews/g3-retrieval-router/claude_plan_review.md
+new file mode 100644
+index 000000000..f4e6a962c
+--- /dev/null
++++ b/docs/reviews/g3-retrieval-router/claude_plan_review.md
+@@ -0,0 +1,37 @@
++The plan is fully written to `/Users/jeremiah/.claude/plans/you-are-an-independent-ethereal-sundae.md`. Here is the concise Goal 3 plan as requested.
++
++# Goal 3 Plan — Unified Memory Retrieval Routing
++
++**Resolved defaults** (clarifying questions went unanswered — alternatives in §8): deterministic core with LLM refinement opt-in/off; memory routes implemented, web/file/tool specified-and-deferred to a Phase B amendment.
++
++### 1. Architecture & ownership seams
++A **planner + router** layered *on top of* G2 (not replacing it). New pure module `agent/retrieval_planner.py` (`plan_retrieval`, `merge_llm_refinement`, `RetrievalPlan/Route`, `ComplexityTier`) — same purity contract as `recall_gate.py`. New `agent/retrieval_router.py` executes a plan under one deadline. Optional `agent/retrieval_llm_classifier.py`. Provider routes in `plugins/memory/chromadb/g3_routes.py`. Seam: `run_agent.py:12710-12769` wraps the existing `enforced_recall` call; `enforced_recall` stays untouched as the Chroma route → memory-route parity guaranteed. G3 lives *inside* the G2 gate.
++
++### 2. Config / rollback
++`memory.retrieval_routing_enabled` (master kill switch), `memory.retrieval_llm_classifier_enabled` (off by default), `memory.retrieval_routing.{allowed_routes,latency_budget_ms,char_budget}`. Rollback: `hermes config set memory.retrieval_routing_enabled false` → bit-identical to G2; `first_turn_recall_enabled false` → pre-G2.
++
++### 3. Deterministic vs LLM boundary
++Deterministic layer owns **every safety decision**: whether to recall (G2 `classify_risk`), permitted route *types*, all budgets/deadlines, filtering, fail-open. LLM may *only* lower the tier, reorder routes, and add queries for already-permitted routes — validated by pure `merge_llm_refinement`; any rejection/timeout/parse-fail → deterministic plan. LLM never gates, never enables a route, never raises a budget.
++
++### 4. Route types & safety
++Phase A: `chroma_memory`, `chroma_session`, `chroma_team`, `session_fts` (local). Phase B (deferred, privacy review): `web`, `file`, `tool`. Common rules: read-only Sentinel/Forge, fail-open, one global deadline, cross-route dedup, 3,500-char budget, `context_sha256`-only ledger. Hard rule: personal/profile/job/continuity classes never route to `web`.
++
++### 5. Assertions/tests
++15 numbered assertions (TDD RED→GREEN): routing-off bit-identical to G2; G3 inside G2 gate; Anduril route parity; default `planner_mode=deterministic`; LLM-fail → deterministic fallback; merge rejects route/budget escalation; tier mapping; web/file/tool never planned by default; cross-route dedup; deadline + degraded notice; planner purity guard; no MEMORY/USER/Chroma writes. New test files mirror G2 layout + live/fake manifest smoke.
++
++### 6. Pivot conditions
++G2 seam changes; no local FTS session store exists; planner can't stay pure; >5s latency; merge-safety unprovable; any route needs Chroma writes/restarts; web/file/tool demanded default-on pre-review.
++
++### 7. Files to edit
++**New:** `agent/retrieval_planner.py`, `agent/retrieval_router.py`, `agent/retrieval_llm_classifier.py`, `plugins/memory/chromadb/g3_routes.py`, `docs/memory/G3_CONTRACT.md`+`G3_STATUS.md`, tests. **Edit (additive):** `run_agent.py:12710-12769`, `hermes_cli/config.py:~1158`, `agent/memory_manager.py`, `g1b_observability.py` (`ALLOWED_EVENT_TYPES`). **Reused unchanged:** `recall_gate.py`, `g2_recall.py`, `enforced_recall`.
++
++### 8. Risks/disagreements
++(1) **Scope** — disagree with shipping web/file/tool in one effort; they cross the read-only-memory boundary → phase them. (2) **LLM classifier** — extra pre-LLM call adds latency/cost/failure mode → keep off by default. (3) Bit-identical rollback harder with a planner layer → short-circuit before any planner construction. (4) Latency: G2 already ~4.8s, fan-out + LLM call risks the 5s budget. (5) **"session FTS"** premise — G2's `search_sessions` is semantic Chroma, not local FTS; must confirm a real local FTS store exists. (6) `merge_llm_refinement` determinism is the whole safety argument. (7) Web route PII leakage to third parties — class-exclusion rule mandatory before Phase B.
++
++---
++
++## Verdict: **APPROVED_PLAN**
++
++For **Phase A** as scoped — deterministic unified planner/router over memory/session routes, LLM refinement opt-in/off, strictly additive over G2, fail-open, single-flag rollback. Conditioned on: controller confirmation of D1/D2; Phase 1 being a docs-only `G3_CONTRACT.md` PR under dual-lane review (matching G1A/G2 sequencing); web/file/tool handled by a separate Phase B amendment after privacy review.
++
++Changes to **REQUEST_CHANGES_PLAN** only if the controller requires all five route types and/or LLM-first-default in a single Goal 3 effort — that needs the latency and privacy reviews named in §8 resolved first.
+diff --git a/docs/reviews/g3-retrieval-router/codex_plan_review.md b/docs/reviews/g3-retrieval-router/codex_plan_review.md
+new file mode 100644
+index 000000000..a8d086d71
+--- /dev/null
++++ b/docs/reviews/g3-retrieval-router/codex_plan_review.md
+@@ -0,0 +1,65 @@
++No files edited.
++
++**Goal 3 Plan**
++
++1. **Architecture / Seams**
++- Add a core planner module, likely `agent/retrieval_router.py`, owning pure route planning, route allowlists, complexity classification, query budgets, and JSON validation.
++- Keep [agent/recall_gate.py](/Users/jeremiah/.hermes/hermes-agent/agent/recall_gate.py:62) as the deterministic G2 high-risk memory gate; G3 may call it but should not weaken it.
++- [run_agent.py](/Users/jeremiah/.hermes/hermes-agent/run_agent.py:12713) remains the only turn orchestration seam. If G3 is enabled, run one unified pre-LLM retrieval plan before first API call; if disabled, keep the current G2 path bit-identical.
++- Memory routes go through [agent/memory_manager.py](/Users/jeremiah/.hermes/hermes-agent/agent/memory_manager.py:333) and provider hooks. Web/file/session routes should not be owned by `MemoryManager`; use a new runtime executor module so memory does not become a generic tool router.
++- Chroma provider remains read-only for G3, refactoring [plugins/memory/chromadb/__init__.py](/Users/jeremiah/.hermes/hermes-agent/plugins/memory/chromadb/__init__.py:691) into reusable route execution while preserving `enforced_recall()` compatibility.
++- Injection continues via ephemeral current-user-message context only, using [append_ephemeral_context_to_user_message](/Users/jeremiah/.hermes/hermes-agent/agent/recall_gate.py:94). No system prompt mutation and no session DB persistence.
++
++2. **Config / Rollback**
++- Add `memory.retrieval_router_enabled: true` as the G3 kill switch.
++- Add `memory.retrieval_router.llm_planner_enabled: true|false` as a narrower rollback for LLM-generated queries. I would start default `false` or `shadow` until live smoke proves value.
++- Optional tuning under `memory.retrieval_router`: `max_routes_per_turn`, `total_char_budget`, per-route timeouts, route enables for `chroma`, `session_fts`, `file`, `web`, `tool`.
++- Existing `memory.first_turn_recall_enabled` must still disable mandatory G2/Chroma memory enforcement. Full rollback: set `memory.retrieval_router_enabled false`; pre-G3 G2 behavior resumes.
++
++3. **Deterministic vs LLM Boundary**
++- Deterministic owns safety-critical decisions: high-risk memory triggers, privacy class, web eligibility, file path scope, route allowlist, freshness/currentness detection, URL/path extraction, and no-route decisions.
++- LLM planner may only generate/rewrite retrieval queries and rank already-allowed routes for complex/ambiguous prompts.
++- LLM output must be strict JSON, schema-validated, timeout-bounded, and unable to add disallowed routes, lower mandatory memory, request writes, or send private memory/profile facts to web.
++- Invalid/timeout LLM planning falls back to deterministic plan.
++
++4. **Route Types / Safety**
++- `memory_semantic`: Chroma memories, user/profile, active agent, team collections where class allows. Read-only only.
++- `session_fts`: SQLite FTS via `SessionDB.search_messages()` / `session_search(mode="fast")`; exclude current session lineage.
++- `session_semantic`: Chroma session summaries for fuzzy continuity.
++- `file_search` / `file_read`: read-only, cwd/repo/explicit-path scoped, deny secrets by default (`.env`, key files, private config) unless explicitly requested.
++- `web_search` / `web_extract`: only for current/public/external facts or explicit URLs. Sanitize queries; never include recalled private facts in web queries.
++- `tool_recall`: idempotent read-only tools only, using the existing allowlist pattern from [agent/tool_guardrails.py](/Users/jeremiah/.hermes/hermes-agent/agent/tool_guardrails.py:13).
++
++5. **Expected Tests**
++- Anduril/SpaceX prompt routes mandatory `memory_semantic` plus session recall, no web.
++- `same as before` triggers mandatory memory/session recall.
++- “latest/current” public query routes web only.
++- URL prompt routes `web_extract`.
++- “in this repo/file” routes file search/read only.
++- Arithmetic/generic coding prompt routes none.
++- LLM planner cannot enable web for private/profile prompts or introduce unknown routes.
++- G3 off produces identical first API payload to pre-G3 path.
++- Route failures fail open, emit `recall_skipped`, and do not block the turn.
++- Injected route context is not persisted to session DB and ledger stores hashes/labels, not raw user text.
++- Chroma/Sentinel/Forge remain read-only; no `MEMORY.md` or `USER.md` writes.
++
++6. **Pivot Conditions**
++- P95 pre-LLM retrieval latency exceeds 5s.
++- LLM planner invalid/timeout rate is materially high, e.g. above 5-10%.
++- Any private prompt content leaks into web/file/tool queries.
++- Route false positives cause noisy context on simple tasks.
++- Implementation requires Chroma schema changes, Chroma writes, service restarts, or memory_tool semantic changes.
++- Multi-route context regularly exceeds budget or degrades answer quality.
++
++7. **Likely Files**
++- New: `docs/memory/G3_CONTRACT.md`, `agent/retrieval_router.py`, `agent/retrieval_context.py`, maybe `agent/retrieval_executor.py`.
++- Edit: [run_agent.py](/Users/jeremiah/.hermes/hermes-agent/run_agent.py:12713), [hermes_cli/config.py](/Users/jeremiah/.hermes/hermes-agent/hermes_cli/config.py:1163), [agent/memory_provider.py](/Users/jeremiah/.hermes/hermes-agent/agent/memory_provider.py:106), [agent/memory_manager.py](/Users/jeremiah/.hermes/hermes-agent/agent/memory_manager.py:333), [plugins/memory/chromadb/__init__.py](/Users/jeremiah/.hermes/hermes-agent/plugins/memory/chromadb/__init__.py:691), [plugins/memory/chromadb/g2_recall.py](/Users/jeremiah/.hermes/hermes-agent/plugins/memory/chromadb/g2_recall.py:1), [plugins/memory/chromadb/g1b_observability.py](/Users/jeremiah/.hermes/hermes-agent/plugins/memory/chromadb/g1b_observability.py:26).
++- Tests: `tests/agent/test_retrieval_router.py`, `tests/run_agent/test_g3_retrieval_wiring.py`, `tests/plugins/memory/test_chromadb_g3_routes.py`.
++
++8. **Risks / Disagreements**
++- Do not put web/file routing into `MemoryManager`; that would blur ownership.
++- LLM planning is the riskiest part. It should start behind a separate flag or shadow mode.
++- Automatic web routing has real privacy risk; deterministic redaction and route eligibility must be strict.
++- G2 and G3 must not double-inject memory context. G3 enabled should replace the G2 orchestration path while preserving G2 semantics inside the plan.
++
++Verdict: APPROVED_PLAN.
+\ No newline at end of file
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index bcd2c10cf..5a3d819d0 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -1161,6 +1161,26 @@ DEFAULT_CONFIG = {
+         # G2 first-turn/current-turn recall kill switch. On by default; set
+         # false to preserve the pre-G2 external prefetch path exactly.
+         "first_turn_recall_enabled": True,
++        # G3 unified retrieval router kill switch. On by default for the pure
++        # deterministic planner/route descriptors; set false to preserve the
++        # pre-G3 G2 recall path exactly. Web/file/tool execution remains
++        # disabled/deferred unless a later privacy-reviewed route executor opts in.
++        "retrieval_routing_enabled": True,
++        "retrieval_routing": {
++            "llm_planner_enabled": False,
++            "char_budget": 3500,
++            "latency_budget_ms": 5000,
++            "allowed_routes": [
++                "memory_semantic",
++                "session_semantic",
++                "session_fts",
++                "web_search",
++                "web_extract",
++                "file_search",
++                "file_read",
++                "tool_recall",
++            ],
++        },
+         # Generated profile (vector-memory-derived prompt block).
+         # Lives behind prompt_source != "legacy" and is rendered by
+         # the active memory provider (e.g. ChromaDB). Core only routes
+diff --git a/run_agent.py b/run_agent.py
+index 43c2e7acc..fd1639fbb 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -2081,6 +2081,11 @@ class AIAgent:
+         self._first_turn_recall_enabled = bool(
+             _mem_cfg_for_policy.get("first_turn_recall_enabled", True)
+         )
++        self._retrieval_routing_enabled = bool(
++            _mem_cfg_for_policy.get("retrieval_routing_enabled", True)
++        )
++        _retrieval_routing_cfg = _mem_cfg_for_policy.get("retrieval_routing", {}) or {}
++        self._retrieval_routing_cfg = _retrieval_routing_cfg if isinstance(_retrieval_routing_cfg, dict) else {}
+
+
+
+diff --git a/tests/agent/test_retrieval_router.py b/tests/agent/test_retrieval_router.py
+new file mode 100644
+index 000000000..259af48f2
+--- /dev/null
++++ b/tests/agent/test_retrieval_router.py
+@@ -0,0 +1,280 @@
++from agent.retrieval_router import (
++    ComplexityTier,
++    RouteKind,
++    build_deterministic_plan,
++    merge_llm_refinement,
++    render_route_context,
++)
++
++
++def route_kinds(plan):
++    return [route.kind for route in plan.routes]
++
++
++def test_anduril_spacex_prompt_routes_memory_and_sessions_without_web():
++    plan = build_deterministic_plan(
++        "help me fill this Anduril application using what you know from the SpaceX application"
++    )
++
++    assert plan.enabled is True
++    assert plan.mandatory is True
++    assert "job_application" in plan.labels
++    assert "continuity" in plan.labels
++    assert RouteKind.MEMORY_SEMANTIC in route_kinds(plan)
++    assert RouteKind.SESSION_SEMANTIC in route_kinds(plan)
++    assert RouteKind.SESSION_FTS in route_kinds(plan)
++    assert RouteKind.WEB_SEARCH not in route_kinds(plan)
++    assert all(route.read_only for route in plan.routes)
++
++
++def test_same_as_before_routes_memory_and_sessions():
++    plan = build_deterministic_plan("same as before")
++
++    assert plan.mandatory is True
++    assert plan.labels == ("continuity",)
++    assert RouteKind.MEMORY_SEMANTIC in route_kinds(plan)
++    assert RouteKind.SESSION_SEMANTIC in route_kinds(plan)
++    assert RouteKind.SESSION_FTS in route_kinds(plan)
++
++
++def test_current_public_prompt_routes_web_without_private_memory():
++    plan = build_deterministic_plan("tell me the latest public SpaceX launch news?")
++
++    assert plan.mandatory is False
++    assert plan.complexity_tier in {ComplexityTier.SIMPLE, ComplexityTier.STANDARD}
++    assert route_kinds(plan) == [RouteKind.WEB_SEARCH]
++    assert plan.routes[0].private_query is False
++    assert "latest public SpaceX launch news" in plan.routes[0].queries[0]
++
++
++def test_url_prompt_routes_web_extract():
++    plan = build_deterministic_plan("summarize https://example.com/research")
++
++    assert route_kinds(plan) == [RouteKind.WEB_EXTRACT]
++    assert plan.routes[0].queries == ("https://example.com/research",)
++
++
++def test_private_url_prompt_does_not_route_web_extract():
++    plan = build_deterministic_plan("summarize my medical diagnosis at https://example.com/report")
++
++    assert RouteKind.WEB_EXTRACT not in route_kinds(plan)
++    assert plan.routes == ()
++
++
++def test_token_or_profile_url_prompt_does_not_route_web_extract():
++    for prompt in [
++        "summarize https://example.com/?token=abc123",
++        "summarize https://example.com/users/jeremiah/profile",
++        "summarize https://example.com/?access_token=abc",
++        "summarize https://example.com/?authToken=abc",
++        "summarize https://example.com/?session_id=abc",
++        "summarize https://example.com/?bearer_token=abc",
++        "what is latest at https://example.com/?access_token=abc",
++        "latest https://example.com/users/jeremiah/profile",
++        "summarize https://abc:password@example.com/news",
++        "what is latest at https://abc:password@example.com/news",
++        "summarize https://abc:xyz@example.com/news",
++        "what is latest at https://abc:xyz@example.com/news",
++    ]:
++        plan = build_deterministic_plan(prompt)
++        assert RouteKind.WEB_EXTRACT not in route_kinds(plan), prompt
++        assert RouteKind.WEB_SEARCH not in route_kinds(plan), prompt
++
++
++def test_internal_or_private_network_url_prompt_does_not_route_web():
++    for prompt in [
++        "summarize http://127.0.0.1:8000/news",
++        "summarize http://localhost:8000/news",
++        "summarize http://10.0.0.1/news",
++        "summarize http://172.16.0.5/news",
++        "summarize http://192.168.1.10/news",
++        "summarize http://169.254.169.254/latest/meta-data/iam/security-credentials/",
++        "summarize https://internal.example.local/news",
++        "what is latest at http://127.0.0.1:8000/news",
++        "what is latest at https://internal.example.local/news",
++        "summarize http://2130706433/news",
++        "summarize http://0x7f000001/news",
++        "summarize http://127.1/news",
++        "summarize http://0x7f.0.0.1/news",
++        "summarize http://0x7f.1/news",
++        "summarize http://127.0x0.0.1/news",
++        "summarize http://100.64.0.1/news",
++        "summarize http://224.0.0.1/news",
++        "summarize http://[ff02::1]/news",
++        "summarize http://[fec0::1]/news",
++        "summarize http://[::1]/news",
++        "summarize http://[::ffff:127.0.0.1]/news",
++        "summarize http://[fe80::1]/news",
++    ]:
++        plan = build_deterministic_plan(prompt)
++        assert RouteKind.WEB_EXTRACT not in route_kinds(plan), prompt
++        assert RouteKind.WEB_SEARCH not in route_kinds(plan), prompt
++
++
++def test_public_url_with_file_path_terms_routes_web_extract_not_local_file():
++    plan = build_deterministic_plan("summarize https://example.com/files/report")
++
++    assert route_kinds(plan) == [RouteKind.WEB_EXTRACT]
++    assert plan.routes[0].queries == ("https://example.com/files/report",)
++
++
++def test_explicit_repo_file_prompt_routes_file_search_read_only():
++    plan = build_deterministic_plan("search this repo for retrieval_router.py")
++
++    assert route_kinds(plan) == [RouteKind.FILE_SEARCH]
++    assert plan.routes[0].read_only is True
++    assert plan.routes[0].private_query is True
++
++
++def test_arithmetic_prompt_plans_no_routes():
++    plan = build_deterministic_plan("what is 19 * 23?")
++
++    assert plan.enabled is True
++    assert plan.mandatory is False
++    assert plan.routes == ()
++    assert plan.reason == "no_retrieval_needed"
++
++
++def test_private_profile_prompt_never_routes_to_web_even_with_latest_keyword():
++    plan = build_deterministic_plan("use my profile and latest resume details for this job application")
++
++    assert plan.mandatory is True
++    assert RouteKind.MEMORY_SEMANTIC in route_kinds(plan)
++    assert RouteKind.WEB_SEARCH not in route_kinds(plan)
++    assert all(route.private_query for route in plan.routes)
++
++
++def test_non_g2_private_freshness_prompt_does_not_route_web():
++    plan = build_deterministic_plan("what is the latest about my medical diagnosis?")
++
++    assert RouteKind.WEB_SEARCH not in route_kinds(plan)
++    assert plan.reason == "no_retrieval_needed"
++
++
++def test_job_relationship_freshness_prompt_does_not_route_web():
++    plan = build_deterministic_plan("what is the latest news about the job I applied to at Anduril?")
++
++    assert RouteKind.WEB_SEARCH not in route_kinds(plan)
++    assert plan.reason == "no_retrieval_needed"
++
++
++def test_repo_file_freshness_prompt_routes_file_only_not_web():
++    plan = build_deterministic_plan("what is the latest in this repo about retrieval routing?")
++
++    assert route_kinds(plan) == [RouteKind.FILE_SEARCH]
++    assert plan.routes[0].private_query is True
++
++
++def test_secretish_file_prompt_is_denied_at_planning_layer():
++    for prompt in [
++        "read file .env",
++        "read file .env?",
++        "read file .env,",
++        "read file .env.local",
++        "read file path=.env",
++        "read file secrets/config.yaml",
++        "read file ~/.aws/credentials",
++        "read file .npmrc",
++        "open file ~/.ssh/id_rsa.",
++        "search this repo for api_key",
++    ]:
++        plan = build_deterministic_plan(prompt)
++        assert plan.routes == (), prompt
++        assert plan.reason == "no_retrieval_needed"
++
++
++def test_file_read_descriptor_has_positive_read_only_path():
++    plan = build_deterministic_plan("read file docs/memory/G3_CONTRACT.md")
++
++    assert route_kinds(plan) == [RouteKind.FILE_READ]
++    assert plan.routes[0].read_only is True
++    assert plan.routes[0].private_query is True
++
++
++def test_llm_refinement_cannot_add_disallowed_route_or_raise_budget():
++    plan = build_deterministic_plan("same as before")
++    refined = merge_llm_refinement(
++        plan,
++        {
++            "char_budget": plan.char_budget + 5000,
++            "routes": [
++                {"kind": "web_search", "queries": ["same as before private user profile"]},
++                {"kind": "memory_semantic", "queries": ["previous durable preference"]},
++            ],
++        },
++    )
++
++    assert refined.char_budget == plan.char_budget
++    assert RouteKind.WEB_SEARCH not in route_kinds(refined)
++    assert RouteKind.MEMORY_SEMANTIC in route_kinds(refined)
++    assert any("previous durable preference" in route.queries for route in refined.routes)
++
++
++def test_llm_refinement_cannot_replace_public_web_query_with_private_query():
++    plan = build_deterministic_plan("what is the latest public SpaceX launch news?")
++    refined = merge_llm_refinement(
++        plan,
++        {
++            "routes": [
++                {"kind": "web_search", "queries": ["latest about Jeremiah private medical diagnosis"]},
++            ],
++        },
++    )
++
++    assert refined.routes == plan.routes
++
++
++def test_llm_refinement_cannot_replace_public_web_extract_with_private_url():
++    plan = build_deterministic_plan("summarize https://example.com/research")
++    refined = merge_llm_refinement(
++        plan,
++        {
++            "routes": [
++                {"kind": "web_extract", "queries": ["https://example.com/users/jeremiah/profile"]},
++            ],
++        },
++    )
++
++    assert refined.routes == plan.routes
++
++
++def test_llm_refinement_cannot_replace_file_route_with_secret_file():
++    plan = build_deterministic_plan("read file docs/memory/G3_CONTRACT.md")
++    for query in [
++        "read file .env",
++        "read file .env.local",
++        "read file path=.env",
++        "read file secrets/config.yaml",
++        "read file ~/.aws/credentials",
++        "read file .npmrc",
++    ]:
++        refined = merge_llm_refinement(
++            plan,
++            {"routes": [{"kind": "file_read", "queries": [query]}]},
++        )
++
++        assert refined.routes == plan.routes, query
++
++
++def test_disabled_plan_short_circuits_to_no_routes():
++    plan = build_deterministic_plan("what is the latest public SpaceX launch news?", enabled=False)
++
++    assert plan.enabled is False
++    assert plan.routes == ()
++    assert plan.reason == "disabled"
++
++
++def test_render_route_context_deduplicates_and_respects_budget():
++    block = render_route_context(
++        [
++            {"route": "memory_semantic", "id": "a", "content": "Durable fact", "score": 0.9},
++            {"route": "session_fts", "id": "b", "content": "Durable fact", "score": 0.8},
++            {"route": "web_search", "id": "c", "content": "Fresh public fact", "score": 0.7},
++        ],
++        char_budget=220,
++    )
++
++    assert block.startswith("## Unified Retrieval Context")
++    assert block.count("Durable fact") == 1
++    assert "Fresh public fact" in block
++    assert len(block) <= 220
+diff --git a/tests/hermes_cli/test_g3_config_defaults.py b/tests/hermes_cli/test_g3_config_defaults.py
+new file mode 100644
+index 000000000..f34470d9e
+--- /dev/null
++++ b/tests/hermes_cli/test_g3_config_defaults.py
+@@ -0,0 +1,14 @@
++from hermes_cli.config import DEFAULT_CONFIG
++
++
++def test_g3_retrieval_routing_defaults_are_safe_and_rollbackable():
++    memory_cfg = DEFAULT_CONFIG["memory"]
++
++    assert memory_cfg["retrieval_routing_enabled"] is True
++    routing = memory_cfg["retrieval_routing"]
++    assert routing["llm_planner_enabled"] is False
++    assert routing["char_budget"] == 3500
++    assert routing["latency_budget_ms"] == 5000
++    assert "memory_semantic" in routing["allowed_routes"]
++    assert "web_search" in routing["allowed_routes"]
++    assert "tool_recall" in routing["allowed_routes"]
+diff --git a/tests/run_agent/test_g2_recall_wiring.py b/tests/run_agent/test_g2_recall_wiring.py
+index 1d021abf6..8af77fe67 100644
+--- a/tests/run_agent/test_g2_recall_wiring.py
++++ b/tests/run_agent/test_g2_recall_wiring.py
+@@ -13,6 +13,13 @@ def test_default_config_enables_g2_kill_switch_by_default():
+     assert DEFAULT_CONFIG["memory"]["first_turn_recall_enabled"] is True
+
+
++def test_run_agent_initializes_g3_config_without_changing_g2_path():
++    assert "_retrieval_routing_enabled" in RUN_AGENT
++    assert "_retrieval_routing_cfg" in RUN_AGENT
++    assert RUN_AGENT.index("_retrieval_routing_enabled") < RUN_AGENT.index("# Memory provider plugin")
++    assert RUN_AGENT.count(".enforced_recall(") >= 1
++
++
+ def test_run_agent_wires_first_turn_recall_before_prefetch_and_injects_ephemerally():
+     assert "_first_turn_recall_enabled" in RUN_AGENT
+     assert ".enforced_recall(" in RUN_AGENT

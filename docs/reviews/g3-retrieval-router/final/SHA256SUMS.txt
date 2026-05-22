@@ -1,0 +1,4 @@
+5491a31ea4fadf672a32425da115bb77f56a9eb82c75d99f9caf89a7b868f40d  docs/reviews/g3-retrieval-router/final/README.md
+2f5f3a0169c6a8aa77ba1a61312a81dd1d510f826e0e856a3daed4ad3db80a05  docs/reviews/g3-retrieval-router/final/pr.diff
+dc6d1f3307aa076184cfa452723d185eaa4ddbd061aff0d9e9593a05cddd9c7a  docs/reviews/g3-retrieval-router/final/codex_final_rereview11.md
+0637faffa50d756f0aa3881b10a923af8081fd4fcd72df427b149e280feda42b  docs/reviews/g3-retrieval-router/final/claude_final_rereview2.md

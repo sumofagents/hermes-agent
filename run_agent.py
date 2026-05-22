@@ -2081,6 +2081,11 @@ class AIAgent:
         self._first_turn_recall_enabled = bool(
             _mem_cfg_for_policy.get("first_turn_recall_enabled", True)
         )
+        self._retrieval_routing_enabled = bool(
+            _mem_cfg_for_policy.get("retrieval_routing_enabled", True)
+        )
+        _retrieval_routing_cfg = _mem_cfg_for_policy.get("retrieval_routing", {}) or {}
+        self._retrieval_routing_cfg = _retrieval_routing_cfg if isinstance(_retrieval_routing_cfg, dict) else {}
         
 
 
