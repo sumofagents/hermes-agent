@@ -1,0 +1,22 @@
+{
+  "completeness_score": 1.0,
+  "deficiencies": [],
+  "evaluated_at": "2026-05-22T12:13:31.604715+00:00",
+  "plan_id": "760d988fee8d6fe1",
+  "recommended_action": "none",
+  "section_scores": {
+    "architecture": 1.0,
+    "controller_operations": 1.0,
+    "decision_rules": 1.0,
+    "deferred_scope": 1.0,
+    "gates": 1.0,
+    "global_execution_rules": 1.0,
+    "goal": 1.0,
+    "non_goals": 1.0,
+    "open_questions": 1.0,
+    "ownership_seams": 1.0,
+    "phases": 1.0,
+    "worktree_strategy": 1.0
+  },
+  "status": "pass"
+}
