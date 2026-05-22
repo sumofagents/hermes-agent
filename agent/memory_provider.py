@@ -103,6 +103,16 @@ class MemoryProvider(ABC):
         """
         return ""
 
+    def enforced_recall(self, query: str, *, first_turn: bool, session_id: str = "") -> str:
+        """Synchronously recall context for high-risk current turns.
+
+        Goal 2 providers override this optional hook. The default is a no-op so
+        all existing providers preserve pre-G2 behavior unless explicitly wired.
+        Returned text is injected into the current user message by core and must
+        not be persisted as raw user text.
+        """
+        return ""
+
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Queue a background recall for the NEXT turn.
 

@@ -330,6 +330,25 @@ class MemoryManager:
                 )
         return "\n\n".join(parts)
 
+    def enforced_recall(self, query: str, *, first_turn: bool, session_id: str = "") -> str:
+        """Collect synchronous current-turn recall context from providers.
+
+        This is opt-in for providers and failure-isolated like prefetch_all().
+        It is only called by core when the G2 kill switch is enabled.
+        """
+        parts = []
+        for provider in self._providers:
+            try:
+                result = provider.enforced_recall(query, first_turn=first_turn, session_id=session_id)
+                if result and result.strip():
+                    parts.append(result)
+            except Exception as e:
+                logger.debug(
+                    "Memory provider '%s' enforced_recall failed (non-fatal): %s",
+                    provider.name, e,
+                )
+        return "\n\n".join(parts)
+
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn."""
         for provider in self._providers:

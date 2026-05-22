@@ -2078,6 +2078,9 @@ class AIAgent:
         self._memory_generated_prompt_cfg = (
             _mem_cfg_for_policy.get("generated_prompt", {}) or {}
         )
+        self._first_turn_recall_enabled = bool(
+            _mem_cfg_for_policy.get("first_turn_recall_enabled", True)
+        )
         
 
 
@@ -12704,6 +12707,67 @@ class AIAgent:
             except Exception:
                 pass
 
+        # G2 enforced recall: for high-risk current turns, synchronously search
+        # memory before the first LLM call and inject the result into the
+        # current user message only. Disabled path short-circuits before any
+        # classification, manager call, or recall_* ledger write.
+        _g2_recall_context = ""
+        if self._first_turn_recall_enabled:
+            _g2_query = original_user_message if isinstance(original_user_message, str) else ""
+            if self._memory_manager:
+                try:
+                    _g2_recall_context = self._memory_manager.enforced_recall(
+                        _g2_query,
+                        first_turn=(self._user_turn_count == 1),
+                        session_id=self.session_id,
+                    ) or ""
+                except Exception:
+                    _g2_recall_context = ""
+            if not _g2_recall_context:
+                try:
+                    from agent.recall_gate import classify_risk, render_degraded_notice
+                    _risk = classify_risk(_g2_query)
+                    if _risk.mandatory:
+                        try:
+                            from plugins.memory.chromadb.g1b_observability import append_feedback_event, feedback_path_for_home
+                            _ctx_sha = hashlib.sha256((_g2_query or "").encode("utf-8")).hexdigest()
+                            _fb_path = feedback_path_for_home(get_hermes_home())
+                            _risk_class = "+".join(getattr(_risk, "risk_classes", ()) or ("mandatory_recall",))
+                            append_feedback_event(
+                                _fb_path,
+                                event_type="recall_needed",
+                                session_id=self.session_id,
+                                platform=getattr(self, "platform", None) or "cli",
+                                gateway_session_key=getattr(self, "_gateway_session_key", None),
+                                labels=list(getattr(_risk, "labels", ()) or []),
+                                context_sha256=_ctx_sha,
+                                first_turn=(self._user_turn_count == 1),
+                                mandatory=True,
+                                risk_class=_risk_class,
+                                query_count=0,
+                                collections_searched=[],
+                                latency_ms=0,
+                            )
+                            append_feedback_event(
+                                _fb_path,
+                                event_type="recall_skipped",
+                                session_id=self.session_id,
+                                platform=getattr(self, "platform", None) or "cli",
+                                gateway_session_key=getattr(self, "_gateway_session_key", None),
+                                labels=list(getattr(_risk, "labels", ()) or []),
+                                context_sha256=_ctx_sha,
+                                first_turn=(self._user_turn_count == 1),
+                                mandatory=True,
+                                risk_class=_risk_class,
+                                skip_reason="no_provider_or_provider_empty",
+                                latency_ms=0,
+                            )
+                        except Exception:
+                            pass
+                        _g2_recall_context = render_degraded_notice(_risk)
+                except Exception:
+                    _g2_recall_context = ""
+
         # External memory provider: prefetch once before the tool loop.
         # Reuse the cached result on every iteration to avoid re-calling
         # prefetch_all() on each tool call (10 tool calls = 10x latency + cost).
@@ -12886,6 +12950,8 @@ class AIAgent:
                 # never mutated, so nothing leaks into session persistence.
                 if idx == current_turn_user_idx and msg.get("role") == "user":
                     _injections = []
+                    if _g2_recall_context:
+                        _injections.append(_g2_recall_context)
                     if _ext_prefetch_cache:
                         _fenced = build_memory_context_block(_ext_prefetch_cache)
                         if _fenced:
@@ -12893,9 +12959,13 @@ class AIAgent:
                     if _plugin_user_context:
                         _injections.append(_plugin_user_context)
                     if _injections:
-                        _base = api_msg.get("content", "")
-                        if isinstance(_base, str):
-                            api_msg["content"] = _base + "\n\n" + "\n\n".join(_injections)
+                        try:
+                            from agent.recall_gate import append_ephemeral_context_to_user_message
+                            api_msg = append_ephemeral_context_to_user_message(api_msg, _injections)
+                        except Exception:
+                            _base = api_msg.get("content", "")
+                            if isinstance(_base, str):
+                                api_msg["content"] = _base + "\n\n" + "\n\n".join(_injections)
 
                 # For ALL assistant messages, pass reasoning back to the API
                 # This ensures multi-turn reasoning context is preserved

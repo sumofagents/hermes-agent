@@ -1158,6 +1158,9 @@ DEFAULT_CONFIG = {
         # G1A boot synthesis kill switch. On by default; set false to return
         # to the pre-G1A non-synthesized Chroma provider block on next boot.
         "boot_synthesis_enabled": True,
+        # G2 first-turn/current-turn recall kill switch. On by default; set
+        # false to preserve the pre-G2 external prefetch path exactly.
+        "first_turn_recall_enabled": True,
         # Generated profile (vector-memory-derived prompt block).
         # Lives behind prompt_source != "legacy" and is rendered by
         # the active memory provider (e.g. ChromaDB). Core only routes
