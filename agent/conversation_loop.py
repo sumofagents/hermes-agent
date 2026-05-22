@@ -22,7 +22,6 @@ import os
 import random
 import re
 import ssl
-import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -430,6 +429,7 @@ def run_conversation(
     current_turn_user_idx = _ctx.current_turn_user_idx
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
+    _g2_recall_context = _ctx.g2_recall_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
     # Main conversation loop counters (pure locals consumed by the loop below).
@@ -608,12 +608,14 @@ def run_conversation(
             api_msg = msg.copy()
 
             # Inject ephemeral context into the current turn's user message.
-            # Sources: memory manager prefetch + plugin pre_llm_call hooks
-            # with target="user_message" (the default).  Both are
+            # Sources: G2 enforced recall, external-memory prefetch, and plugin
+            # pre_llm_call hooks with target="user_message" (the default).  All are
             # API-call-time only — the original message in `messages` is
             # never mutated, so nothing leaks into session persistence.
             if idx == current_turn_user_idx and msg.get("role") == "user":
                 _injections = []
+                if _g2_recall_context:
+                    _injections.append(_g2_recall_context)
                 if _ext_prefetch_cache:
                     _fenced = build_memory_context_block(_ext_prefetch_cache)
                     if _fenced:
@@ -621,9 +623,13 @@ def run_conversation(
                 if _plugin_user_context:
                     _injections.append(_plugin_user_context)
                 if _injections:
-                    _base = api_msg.get("content", "")
-                    if isinstance(_base, str):
-                        api_msg["content"] = _base + "\n\n" + "\n\n".join(_injections)
+                    try:
+                        from agent.recall_gate import append_ephemeral_context_to_user_message
+                        api_msg = append_ephemeral_context_to_user_message(api_msg, _injections)
+                    except Exception:
+                        _base = api_msg.get("content", "")
+                        if isinstance(_base, str):
+                            api_msg["content"] = _base + "\n\n" + "\n\n".join(_injections)
 
             # For ALL assistant messages, pass reasoning back to the API
             # This ensures multi-turn reasoning context is preserved

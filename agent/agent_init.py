@@ -1128,6 +1128,31 @@ def init_agent(
     
 
 
+    # Core prompt-source policy — provider-agnostic.
+    _mem_cfg_for_policy = _agent_cfg.get("memory", {}) if isinstance(_agent_cfg, dict) else {}
+    _prompt_source = _mem_cfg_for_policy.get("prompt_source", "legacy")
+    try:
+        from run_agent import _VALID_MEMORY_PROMPT_SOURCES
+        _valid_prompt_sources = _VALID_MEMORY_PROMPT_SOURCES
+    except Exception:
+        _valid_prompt_sources = {"legacy", "shadow", "provider_with_legacy_fallback", "provider"}
+    if _prompt_source not in _valid_prompt_sources:
+        _ra().logger.warning(
+            "Unknown memory.prompt_source=%r — falling back to 'legacy'.",
+            _prompt_source,
+        )
+        _prompt_source = "legacy"
+    agent._memory_prompt_source = _prompt_source
+    agent._memory_suppress_builtin_when_external = bool(
+        _mem_cfg_for_policy.get("suppress_builtin_when_external", False)
+    )
+    agent._memory_generated_prompt_cfg = (
+        _mem_cfg_for_policy.get("generated_prompt", {}) or {}
+    )
+    agent._first_turn_recall_enabled = bool(
+        _mem_cfg_for_policy.get("first_turn_recall_enabled", True)
+    )
+
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
     agent._memory_manager = None
@@ -1148,6 +1173,10 @@ def init_agent(
                         "platform": platform or "cli",
                         "hermes_home": str(get_hermes_home()),
                         "agent_context": "primary",
+                        "prompt_source": getattr(agent, "_memory_prompt_source", "legacy"),
+                        "generated_prompt_enabled": bool(
+                            getattr(agent, "_memory_generated_prompt_cfg", {}).get("enabled", False)
+                        ),
                     }
                     # Thread session title for memory provider scoping
                     # (e.g. honcho uses this to derive chat-scoped session keys)

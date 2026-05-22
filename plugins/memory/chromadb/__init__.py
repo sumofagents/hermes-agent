@@ -22,6 +22,7 @@ Ported from:
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -670,7 +671,189 @@ class ChromaDBMemoryProvider(MemoryProvider):
             legacy = self._build_legacy_generated_profile_block()
             return _finish(legacy, fallback=True, reason="exception", model=g1a.SYNTHESIS_MODEL)
 
-    # -- Prefetch (semantic recall) -----------------------------------------
+    # -- Prefetch / recall ---------------------------------------------------
+
+    def _append_recall_event(self, event_type: str, *, context_sha256: str = "", **extra: Any) -> None:
+        try:
+            from plugins.memory.chromadb.g1b_observability import append_feedback_event, feedback_path_for_home
+            append_feedback_event(
+                feedback_path_for_home(self._hermes_home),
+                event_type=event_type,
+                session_id=str(extra.pop("session_id", "") or self._session_id),
+                platform=str(extra.pop("platform", "") or self._platform or "cli"),
+                gateway_session_key=extra.pop("gateway_session_key", self._gateway_session_key),
+                context_sha256=context_sha256,
+                **extra,
+            )
+        except Exception as e:
+            logger.debug("ChromaDB G2 recall feedback failed: %s", e)
+
+    def enforced_recall(self, query: str, *, first_turn: bool, session_id: str = "") -> str:
+        """Synchronous read-only G2 recall for high-risk current turns."""
+        start = time.monotonic()
+        from agent.recall_gate import build_queries, classify_risk, render_degraded_notice
+        from plugins.memory.chromadb import g2_recall
+
+        risk = classify_risk(query or "")
+        context_sha = hashlib.sha256((query or "").encode("utf-8")).hexdigest()
+        queries = build_queries(query or "", risk)
+        labels = list(risk.labels)
+        collections_searched = ["memories", "sessions", f"agent_{self._agent_name}"]
+        if "fleet_project" in risk.risk_classes:
+            collections_searched.extend(["team_knowledge", "team_ops"])
+
+        elapsed_ms = lambda: int((time.monotonic() - start) * 1000)
+
+        if not risk.mandatory and risk.level == "no_recall":
+            self._append_recall_event(
+                "recall_skipped",
+                context_sha256=context_sha,
+                labels=[],
+                first_turn=bool(first_turn),
+                mandatory=False,
+                risk_class="no_recall",
+                query_count=0,
+                collections_searched=[],
+                skip_reason="not_triggered",
+                latency_ms=elapsed_ms(),
+                session_id=session_id,
+            )
+            return ""
+
+        self._append_recall_event(
+            "recall_needed",
+            context_sha256=context_sha,
+            labels=labels,
+            first_turn=bool(first_turn),
+            mandatory=bool(risk.mandatory),
+            risk_class="+".join(risk.risk_classes),
+            query_count=len(queries),
+            collections_searched=collections_searched,
+            latency_ms=0,
+            session_id=session_id,
+        )
+
+        if self._cron_skipped or not self._available:
+            self._append_recall_event(
+                "recall_skipped",
+                context_sha256=context_sha,
+                labels=labels,
+                first_turn=bool(first_turn),
+                mandatory=bool(risk.mandatory),
+                risk_class="+".join(risk.risk_classes),
+                skip_reason="chroma_unavailable",
+                latency_ms=elapsed_ms(),
+                session_id=session_id,
+            )
+            return render_degraded_notice(risk) if risk.mandatory else ""
+
+        try:
+            embeddings = self._embed_with_timeout(queries, timeout_seconds=4.0)
+        except concurrent.futures.TimeoutError:
+            self._append_recall_event(
+                "recall_skipped", context_sha256=context_sha, labels=labels,
+                first_turn=bool(first_turn), mandatory=bool(risk.mandatory),
+                risk_class="+".join(risk.risk_classes), skip_reason="timeout",
+                latency_ms=elapsed_ms(), session_id=session_id,
+            )
+            return render_degraded_notice(risk) if risk.mandatory else ""
+        except Exception:
+            self._append_recall_event(
+                "recall_skipped", context_sha256=context_sha, labels=labels,
+                first_turn=bool(first_turn), mandatory=bool(risk.mandatory),
+                risk_class="+".join(risk.risk_classes), skip_reason="embedding_unavailable",
+                latency_ms=elapsed_ms(), session_id=session_id,
+            )
+            return render_degraded_notice(risk) if risk.mandatory else ""
+
+        raw_candidates: list[g2_recall.RecallCandidate] = []
+        deadline = start + 4.8
+        collection_keys = ["memories", "sessions", f"agent_{self._agent_name}"]
+        if "fleet_project" in risk.risk_classes:
+            collection_keys.extend(["team_knowledge", "team_ops"])
+        for query_index, embedding in enumerate(embeddings):
+            for key in collection_keys:
+                if time.monotonic() > deadline:
+                    break
+                collection = self._collections.get(key)
+                if collection is None:
+                    continue
+                try:
+                    where = None
+                    raw = self._query_with_vector_timeout(collection, embedding, n_results=12, where=where, timeout_seconds=max(0.1, deadline - time.monotonic()))
+                    rows = self._score_results(self._format_results(raw))
+                    rows.sort(key=lambda item: item.get("composite_score", 0), reverse=True)
+                    for rank, row in enumerate(rows, start=1):
+                        cand = g2_recall.candidate_from_row(row, collection=key, rank=rank, query_index=query_index)
+                        # Conservative G2-only ephemeral fallback for transient ops.
+                        if cand.durability in {"", "unknown"}:
+                            lowered = cand.content.lower()
+                            if "pr #" in lowered or "commit" in lowered or "temporary" in lowered:
+                                cand.durability = "ephemeral"
+                        raw_candidates.append(cand)
+                except Exception:
+                    continue
+
+        deduped, dup_drops = g2_recall.dedup_candidates(raw_candidates)
+        allow_ephemeral = "fleet_project" in risk.risk_classes
+        filtered, eph_drops = g2_recall.filter_ephemeral(deduped, allow_ephemeral=allow_ephemeral)
+        selected = g2_recall.select_within_limits(filtered)
+        block = ""
+        injected_selected = []
+        if selected:
+            block, injected_selected = g2_recall.render_recall_block_with_candidates(selected, risk, char_budget=3500)
+        over_budget_drops = {
+            c.fact_id: "over_budget"
+            for c in selected
+            if c.fact_id not in {kept.fact_id for kept in injected_selected}
+        }
+
+        if not injected_selected or not block.strip():
+            self._append_recall_event(
+                "recall_skipped",
+                context_sha256=context_sha,
+                labels=labels,
+                first_turn=bool(first_turn),
+                mandatory=bool(risk.mandatory),
+                risk_class="+".join(risk.risk_classes),
+                skip_reason="no_candidates",
+                latency_ms=elapsed_ms(),
+                dropped_ids={**dup_drops, **eph_drops, **over_budget_drops},
+                session_id=session_id,
+            )
+            return render_degraded_notice(risk) if risk.mandatory else ""
+
+        for idx, cand in enumerate(injected_selected, start=1):
+            self._append_recall_event(
+                "recall_retrieved",
+                context_sha256=context_sha,
+                labels=labels,
+                fact_id=cand.fact_id,
+                collection=cand.collection,
+                source=cand.source,
+                target=cand.target,
+                rank=idx,
+                query_index=cand.query_index,
+                score=cand.score,
+                durability=cand.durability,
+                latency_ms=elapsed_ms(),
+                session_id=session_id,
+            )
+        self._append_recall_event(
+            "recall_used",
+            context_sha256=context_sha,
+            labels=labels,
+            first_turn=bool(first_turn),
+            mandatory=bool(risk.mandatory),
+            risk_class="+".join(risk.risk_classes),
+            injected_chars=len(block),
+            total_latency_ms=elapsed_ms(),
+            latency_ms=elapsed_ms(),
+            selected_ids=[c.fact_id for c in injected_selected],
+            dropped_ids={**dup_drops, **eph_drops, **over_budget_drops},
+            session_id=session_id,
+        )
+        return block
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Return prefetched vector memory context from background thread."""
@@ -1146,6 +1329,36 @@ class ChromaDBMemoryProvider(MemoryProvider):
         embeddings = self._embed([query_text])  # raises if no EF
         kwargs["query_embeddings"] = embeddings
         return collection.query(**kwargs)
+
+    def _embed_with_timeout(self, texts: List[str], timeout_seconds: float = 4.0):
+        """Embed texts under a wall-clock cap for G2 mandatory recall."""
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(self._embed, texts)
+        try:
+            return future.result(timeout=timeout_seconds)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    @staticmethod
+    def _query_with_vector(collection, embedding, n_results: int = 10, where=None):
+        """Query Chroma using a precomputed embedding to avoid repeated embeds."""
+        kwargs = {
+            "query_embeddings": [embedding],
+            "n_results": n_results,
+            "include": ["documents", "metadatas", "distances"],
+        }
+        if where:
+            kwargs["where"] = where
+        return collection.query(**kwargs)
+
+    def _query_with_vector_timeout(self, collection, embedding, n_results: int = 10, where=None, timeout_seconds: float = 1.0):
+        """Run a Chroma vector query under the remaining G2 recall deadline."""
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(self._query_with_vector, collection, embedding, n_results, where)
+        try:
+            return future.result(timeout=max(0.1, timeout_seconds))
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     @staticmethod
     def _make_id(content: str, target: str) -> str:
