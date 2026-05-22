@@ -33,6 +33,22 @@ def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
         help="Provider to configure directly (e.g. honcho), skipping the picker",
     )
     memory_sub.add_parser("status", help="Show current memory provider config")
+    receipts_parser = memory_sub.add_parser(
+        "receipts",
+        help="Summarize local boot synthesis receipts",
+        description="Read-only summary of ~/.hermes/logs/boot_synthesis.jsonl",
+    )
+    receipts_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON summary",
+    )
+    receipts_parser.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="Maximum number of most-recent receipts to summarize (default: 100)",
+    )
     memory_sub.add_parser("off", help="Disable external provider (built-in only)")
     _reset_parser = memory_sub.add_parser(
         "reset",
