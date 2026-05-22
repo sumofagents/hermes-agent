@@ -5,12 +5,20 @@ from agent.recall_gate import append_ephemeral_context_to_user_message
 
 REPO = Path(__file__).resolve().parents[2]
 RUN_AGENT = (REPO / "agent" / "conversation_loop.py").read_text(encoding="utf-8")
+AGENT_INIT = (REPO / "agent" / "agent_init.py").read_text(encoding="utf-8")
 MEMORY_MANAGER = (REPO / "agent" / "memory_manager.py").read_text(encoding="utf-8")
 MEMORY_PROVIDER = (REPO / "agent" / "memory_provider.py").read_text(encoding="utf-8")
 
 
 def test_default_config_enables_g2_kill_switch_by_default():
     assert DEFAULT_CONFIG["memory"]["first_turn_recall_enabled"] is True
+
+
+def test_run_agent_initializes_g3_config_without_changing_g2_path():
+    assert "_retrieval_routing_enabled" in AGENT_INIT
+    assert "_retrieval_routing_cfg" in AGENT_INIT
+    assert AGENT_INIT.index("_retrieval_routing_enabled") < AGENT_INIT.index("# Memory provider plugin")
+    assert RUN_AGENT.count(".enforced_recall(") >= 1
 
 
 def test_run_agent_wires_first_turn_recall_before_prefetch_and_injects_ephemerally():

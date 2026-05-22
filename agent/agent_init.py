@@ -1152,6 +1152,13 @@ def init_agent(
     agent._first_turn_recall_enabled = bool(
         _mem_cfg_for_policy.get("first_turn_recall_enabled", True)
     )
+    agent._retrieval_routing_enabled = bool(
+        _mem_cfg_for_policy.get("retrieval_routing_enabled", True)
+    )
+    _retrieval_routing_cfg = _mem_cfg_for_policy.get("retrieval_routing", {}) or {}
+    agent._retrieval_routing_cfg = (
+        _retrieval_routing_cfg if isinstance(_retrieval_routing_cfg, dict) else {}
+    )
 
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
@@ -1176,6 +1183,9 @@ def init_agent(
                         "prompt_source": getattr(agent, "_memory_prompt_source", "legacy"),
                         "generated_prompt_enabled": bool(
                             getattr(agent, "_memory_generated_prompt_cfg", {}).get("enabled", False)
+                        ),
+                        "boot_synthesis_enabled": bool(
+                            _mem_cfg_for_policy.get("boot_synthesis_enabled", True)
                         ),
                     }
                     # Thread session title for memory provider scoping
