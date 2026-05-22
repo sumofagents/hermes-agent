@@ -1161,6 +1161,26 @@ DEFAULT_CONFIG = {
         # G2 first-turn/current-turn recall kill switch. On by default; set
         # false to preserve the pre-G2 external prefetch path exactly.
         "first_turn_recall_enabled": True,
+        # G3 unified retrieval router kill switch. On by default for the pure
+        # deterministic planner/route descriptors; set false to preserve the
+        # pre-G3 G2 recall path exactly. Web/file/tool execution remains
+        # disabled/deferred unless a later privacy-reviewed route executor opts in.
+        "retrieval_routing_enabled": True,
+        "retrieval_routing": {
+            "llm_planner_enabled": False,
+            "char_budget": 3500,
+            "latency_budget_ms": 5000,
+            "allowed_routes": [
+                "memory_semantic",
+                "session_semantic",
+                "session_fts",
+                "web_search",
+                "web_extract",
+                "file_search",
+                "file_read",
+                "tool_recall",
+            ],
+        },
         # Generated profile (vector-memory-derived prompt block).
         # Lives behind prompt_source != "legacy" and is rendered by
         # the active memory provider (e.g. ChromaDB). Core only routes
