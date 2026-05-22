@@ -1694,6 +1694,45 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+        # Prompt-source policy for the bounded MEMORY/USER blocks.
+        #   "legacy"  — legacy behavior. Legacy MEMORY/USER markdown
+        #               blocks are injected; provider block is additive.
+        #   "shadow"  — like legacy. Provider may run/cache/debug a
+        #               generated profile but must not replace legacy.
+        #   "provider_with_legacy_fallback" — if the external provider
+        #               returns a non-degraded block, suppress only the
+        #               legacy MEMORY/USER markdown blocks. If the
+        #               provider block is missing or degraded, legacy
+        #               remains as additive fallback.
+        #   "provider" — strict. Use the external provider block only.
+        #               If both live generation and cache are empty,
+        #               inject a visible "# Memory Provider Unavailable"
+        #               marker and log a warning.
+        # Unknown values fall back to "legacy".
+        "prompt_source": "provider_with_legacy_fallback",
+        # Upstream #29020 compatibility flag. Honored only when
+        # prompt_source == "legacy"; ignored in shadow / provider_*
+        # modes (those govern suppression themselves).
+        "suppress_builtin_when_external": False,
+        # G1A boot synthesis kill switch. On by default; set false to return
+        # to the pre-G1A non-synthesized Chroma provider block on next boot.
+        "boot_synthesis_enabled": True,
+        # Generated profile (vector-memory-derived prompt block).
+        # Lives behind prompt_source != "legacy" and is rendered by
+        # the active memory provider (e.g. ChromaDB). Core only routes
+        # the config; it does not generate or read the block content.
+        "generated_prompt": {
+            "enabled": True,
+            "max_user_chars": 1375,
+            "max_memory_chars": 2200,
+            "cache_enabled": True,
+            "cache_ttl_seconds": 86400,
+            "fallback_to_cache": True,
+            "fallback_to_legacy": True,
+            # Production prompt does not carry the full debug receipt;
+            # the cache artifact always does.
+            "include_debug_header": False,
+        },
     },
 
     # Subagent delegation — override the provider:model used by delegate_task
