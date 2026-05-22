@@ -328,6 +328,32 @@ The API server gives full access to hermes-agent's toolset, **including terminal
 The default bind address (`127.0.0.1`) is for local-only use. Browser access is disabled by default; enable it only for explicit trusted origins.
 :::
 
+### Post-restart validation
+
+Use `hermes gateway validate` after starting or restarting a gateway. The command is read-only: it does not restart services, edit `.env`, or write secrets. It checks runtime/service state, `/health`, `/health/detailed`, `/v1/models`, `/v1/capabilities`, recent gateway log warnings/errors, and local git state.
+
+```bash
+hermes gateway validate
+hermes gateway validate --json
+```
+
+If `API_SERVER_KEY` is set in Hermes' environment or `~/.hermes/.env`, validation sends `Authorization: Bearer ...` to authenticated endpoints without printing the token. To prove auth is actually enforced, use `--expect-auth`:
+
+```bash
+hermes gateway validate --expect-auth --api-key-env API_SERVER_KEY --json
+```
+
+With `--expect-auth`, `/v1/models` must return `401` without a token and `200` with the token. `/health` and `/health/detailed` intentionally remain unauthenticated.
+
+Optional checks:
+
+```bash
+hermes gateway validate --probe-memory   # include Chroma/Forge readiness probes
+hermes gateway validate --chat-smoke     # run a tiny /v1/chat/completions smoke test
+```
+
+For local API lock-down, keep the secret rollout out of git: generate a bearer token locally, write `API_SERVER_KEY` to the Hermes profile `.env`, write the matching frontend token to that frontend's own env file, restart the gateway, then run `hermes gateway validate --expect-auth --api-key-env API_SERVER_KEY --json`. The validator redacts bearer tokens in JSON and text output.
+
 ## Configuration
 
 ### Environment Variables
