@@ -14,6 +14,7 @@ import shlex
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
+from hermes_cli.config import load_config
 
 
 # ---------------------------------------------------------------------------
@@ -393,8 +394,6 @@ def _write_env_vars(env_path: Path, env_writes: dict) -> None:
 
 def cmd_status(args) -> None:
     """Show current memory provider config."""
-    from hermes_cli.config import load_config
-
     config = load_config()
     mem_config = config.get("memory", {})
     provider_name = mem_config.get("provider", "")
@@ -481,6 +480,50 @@ def cmd_receipts(args) -> None:
     print()
 
 
+def cmd_doctor(args) -> None:
+    """Read-only local memory readiness report and optional Chroma/Forge probe."""
+    import json
+    from plugins.memory.chromadb.g1c_readiness import build_readiness_report
+
+    raw_limit = getattr(args, "limit", 100)
+    limit = 100 if raw_limit is None else max(0, int(raw_limit))
+    report = build_readiness_report(
+        hermes_home=get_hermes_home(),
+        config=load_config(),
+        limit=limit,
+        probe=bool(getattr(args, "probe", False)),
+        strict=bool(getattr(args, "strict", False)),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(report, sort_keys=True, indent=2))
+    else:
+        print("\nMemory doctor")
+        print("────────────────────────────────────────")
+        provider_check = next(
+            (c for c in report["config"]["checks"] if c["name"] == "memory.provider"),
+            {"actual": ""},
+        )
+        print(f"  ok: {report['ok']}")
+        print(f"  provider: {provider_check.get('actual') or '(none)'}")
+        print(f"  chromadb.json: {report['chromadb_json'].get('path')} ok={report['chromadb_json'].get('ok')}")
+        print(f"  boot receipts: {report['boot']['receipt_count']} (malformed={report['boot']['malformed_count']})")
+        print(
+            f"  feedback events: {report['feedback']['event_count']} "
+            f"(malformed={report['feedback']['malformed_count']}, missing={report['feedback'].get('missing')})"
+        )
+        print(f"  feedback event types: {report['feedback']['event_types']}")
+        if report.get("probe_enabled"):
+            chroma = report.get("chroma_probe", {})
+            forge = report.get("forge_probe", {})
+            print(f"  Chroma probe: ok={chroma.get('ok')} host={chroma.get('host')} port={chroma.get('port')}")
+            print(f"  Forge probe: ok={forge.get('ok')} url={forge.get('url')}")
+        else:
+            print("  network probe: skipped (pass --probe to verify Chroma/Forge reachability)")
+        print()
+    if getattr(args, "strict", False) and not report.get("ok"):
+        raise SystemExit(1)
+
+
 # ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
@@ -494,5 +537,7 @@ def memory_command(args) -> None:
         cmd_status(args)
     elif sub == "receipts":
         cmd_receipts(args)
+    elif sub == "doctor":
+        cmd_doctor(args)
     else:
         cmd_status(args)

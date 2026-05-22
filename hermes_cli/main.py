@@ -11162,6 +11162,35 @@ Examples:
         default=100,
         help="Maximum number of most-recent receipts to summarize (default: 100)",
     )
+    doctor_parser = memory_sub.add_parser(
+        "doctor",
+        help="Read-only memory readiness report and optional Chroma/Forge probe",
+        description=(
+            "Summarize local boot/feedback memory observability and, with --probe, "
+            "verify configured ChromaDB and Forge embedding endpoints read-only."
+        ),
+    )
+    doctor_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON report",
+    )
+    doctor_parser.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="Maximum number of most-recent JSONL records to summarize (default: 100)",
+    )
+    doctor_parser.add_argument(
+        "--probe",
+        action="store_true",
+        help="Opt in to read-only ChromaDB/Forge network probes",
+    )
+    doctor_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Exit nonzero if any executed readiness check fails",
+    )
     memory_sub.add_parser("off", help="Disable external provider (built-in only)")
     _reset_parser = memory_sub.add_parser(
         "reset",
