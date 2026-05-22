@@ -189,9 +189,11 @@ def summarize_boot_receipts(records: Iterable[dict[str, Any]]) -> dict[str, Any]
 
 def summarize_feedback_events(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
     malformed = int(getattr(records, "malformed_count", 0) or 0)
+    missing = bool(getattr(records, "missing", False))
     rows = list(records)
     if not hasattr(records, "malformed_count"):
         malformed = max((int(r.get("_malformed_count", 0) or 0) for r in rows), default=0)
+        missing = bool(rows[0].get("_missing", False)) if rows else True
     event_types: Counter[str] = Counter()
     labels: Counter[str] = Counter()
     facts: Counter[str] = Counter()
@@ -203,6 +205,7 @@ def summarize_feedback_events(records: Iterable[dict[str, Any]]) -> dict[str, An
             labels[str(label)] += 1
     return {
         "schema_version": FEEDBACK_SCHEMA_VERSION,
+        "missing": missing,
         "event_count": len(rows),
         "malformed_count": malformed,
         "event_types": _counter_dict(event_types),
