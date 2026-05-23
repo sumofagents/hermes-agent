@@ -275,7 +275,7 @@ Required fields:
 - `output_chars`: synthesized output character count, or legacy fallback output character count when fallback emits the legacy block.
 - `latency_ms`: end-to-end synthesis latency in milliseconds, or fallback path latency when synthesis is intentionally not attempted.
 - `fallback_path_taken`: boolean.
-- `fallback_reason`: one of `null`, `timeout`, `chroma_unreachable`, `model_unreachable`, `empty_output`, `unsafe_output`, `kill_switch_off`, `exception`.
+- `fallback_reason`: one of `null`, `timeout`, `chroma_unreachable`, `model_unreachable`, `empty_output`, `malformed_output`, `unsafe_output`, `kill_switch_off`, `exception`.
 - `output_sha256`: SHA-256 of the emitted boot block content.
 - `previous_block_sha256`: SHA-256 of the previous emitted boot block found from the most recent prior receipt when available, otherwise `null`.
 - `diff_summary`: compact summary of line changes against `previous_block_sha256` content when the previous block can be reconstructed or cached, otherwise `null`.
