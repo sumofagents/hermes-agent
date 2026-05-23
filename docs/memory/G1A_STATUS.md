@@ -35,4 +35,6 @@ Updated: 2026-05-21
 - Final-review repair tightened receipt semantics: Chroma-unreachable boots now append one receipt, synthesis timeout/empty/unreachable/unsafe fallback reasons are distinguished, and attempted-synthesis fallbacks keep model=qwen2.5:7b in receipts.
 - The kill switch now routes deterministic profile ranking through the exact pre-G1A 0.5/0.3/0.2 score path while the enabled renderer path uses the G1A five-signal formula.
 - The live manifest smoke now opens Chroma collections read-only with get_collection rather than get_or_create_collection.
+- Latency follow-up: qwen synthesis now uses a compact <=2,000-character prompt, bounded Ollama generation (`num_predict=160`), and top-level `keep_alive="5m"`; keep_alive helps subsequent boots while the model remains resident, but the first cold boot can still pay model-load cost.
+- Latency follow-up: non-empty qwen output without a complete `<memory-profile ...></memory-profile>` wrapper is now a distinct `malformed_output` fallback reason, while harmless preamble/trailing text around a complete wrapper is stripped.
 - The implementation PR must remain unmerged until explicit controller authorization after dual-lane final review and CI observation.
