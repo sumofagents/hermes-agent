@@ -387,11 +387,65 @@ def _unsafe_output(text: str) -> bool:
     return any(token in lowered for token in ["<system", "</system", "ignore previous instructions", "jailbreak"])
 
 
-def _extract_memory_profile(text: str) -> str:
-    match = re.search(r"<memory-profile\b[^>]*>[\s\S]*?</memory-profile>", text or "", re.IGNORECASE)
+def _normalize_repair_bullet(line: str) -> Optional[str]:
+    """Normalize complete qwen bullet lines from a profile block.
+
+    Live qwen often emits useful lines as ``-> fact`` and then hits the
+    ``num_predict`` limit before the closing tag.  Only salvage lines that look
+    complete enough for prompt insertion; drop trailing fragments and any
+    prompt-injection-like content.
+    """
+    raw = (line or "").strip()
+    if not raw:
+        return None
+    match = re.match(r"^(?:-\s*>|->|[-*])\s+(.+)$", raw)
     if not match:
+        return None
+    fact = match.group(1).strip()
+    quoted_complete = (len(fact) >= 2 and fact[0] == fact[-1] and fact[0] in {'\"', "'"})
+    fact = fact.strip("\"'").strip()
+    if not fact:
+        return None
+    # Treat an unterminated final line as a fragment rather than inventing a
+    # memory fact. Complete qwen bullets either end with punctuation or have a
+    # balanced quote wrapper from the model.
+    if not quoted_complete and fact[-1] not in ".!?\u201d":
+        return None
+    from plugins.memory.chromadb.prompt_profile import sanitize_fact
+
+    cleaned, demoted = sanitize_fact(fact)
+    if demoted or not cleaned:
+        return None
+    return f'- > "{cleaned}"'
+
+
+def _repair_truncated_memory_profile(text: str) -> str:
+    open_match = re.search(r"<memory-profile\b[^>]*>", text or "", re.IGNORECASE)
+    if not open_match:
         raise MalformedOutput("missing complete memory-profile wrapper")
-    return match.group(0).strip()
+    # Repair mode is only for length-truncated qwen output.  Keep the wrapper
+    # contract deterministic instead of trusting model-fabricated attributes.
+    opening = '<memory-profile source="chromadb" degraded="false">'
+    body = (text or "")[open_match.end():]
+    bullets = []
+    for line in body.splitlines():
+        if re.fullmatch(r"\s*</memory-profile>\s*", line or "", re.IGNORECASE):
+            break
+        normalized = _normalize_repair_bullet(line)
+        if normalized:
+            bullets.append(normalized)
+        if len(bullets) >= 8:
+            break
+    if not bullets:
+        raise MalformedOutput("missing complete memory-profile wrapper")
+    return "\n".join([opening, *bullets, "</memory-profile>"])
+
+
+def _extract_memory_profile(text: str) -> str:
+    # Use the line-wise normalizer for both complete and length-truncated
+    # wrappers. A bare regex match can be fooled by an injected closing tag
+    # inside a bullet; the normalizer stops only on a standalone closing tag.
+    return _repair_truncated_memory_profile(text)
 
 
 def synthesize_with_ollama(
