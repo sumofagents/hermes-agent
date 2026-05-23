@@ -136,6 +136,89 @@ def test_receipt_writer_appends_once_and_populates_required_fields(tmp_path):
     assert "vectors" not in lines[0]
 
 
+def test_synthesis_prompt_is_compact_and_under_latency_ceiling():
+    from plugins.memory.chromadb import g1a
+
+    rows = [
+        _fact(
+            f"fact-{i}",
+            "Durable boot fact with enough detail to exceed the per-fact cap. " + ("x" * 500),
+            target="user" if i == 0 else "memory",
+        )
+        for i in range(8)
+    ]
+    prompt = g1a.build_synthesis_prompt(rows)
+    assert len(prompt) <= g1a.SYNTHESIS_PROMPT_INPUT_CHAR_CEILING
+    assert "\n  {" not in prompt
+    assert '"content":"' in prompt
+    assert all(len(item["content"]) <= g1a.SYNTHESIS_FACT_CONTENT_CHARS for item in json.loads(prompt[prompt.index("["):]))
+
+
+def test_synthesis_prompt_ceiling_survives_long_prompt_metadata():
+    from plugins.memory.chromadb import g1a
+
+    rows = [
+        _fact(
+            f"fact-{i}-" + ("y" * 300),
+            "Durable boot fact with enough detail to exceed the per-fact cap. " + ("x" * 500),
+            target="user" if i == 0 else "memory",
+        )
+        for i in range(8)
+    ]
+    prompt = g1a.build_synthesis_prompt(rows)
+    facts = json.loads(prompt[prompt.index("["):])
+    assert len(prompt) <= g1a.SYNTHESIS_PROMPT_INPUT_CHAR_CEILING
+    assert len(facts) == 8
+    assert all(len(item["id"]) <= g1a.SYNTHESIS_FACT_ID_CHARS for item in facts)
+
+
+def test_synthesize_with_ollama_uses_bounded_payload_and_extracts_wrapper(monkeypatch):
+    import plugins.memory.chromadb.g1a as g1a
+
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+        def read(self):
+            return json.dumps({
+                "response": "Here is the profile:\n<memory-profile source=\"chromadb\" degraded=\"false\">\n- > \"durable fact\"\n</memory-profile>\n"
+            }).encode("utf-8")
+
+    def fake_urlopen(req, timeout):
+        captured["timeout"] = timeout
+        captured["payload"] = json.loads(req.data.decode("utf-8"))
+        return FakeResponse()
+
+    monkeypatch.setattr(g1a.urllib.request, "urlopen", fake_urlopen)
+    out = g1a.synthesize_with_ollama(prompt="prompt", host="http://ollama.local")
+
+    assert out.startswith("<memory-profile ")
+    assert out.endswith("</memory-profile>")
+    assert captured["payload"]["options"]["num_predict"] == g1a.SYNTHESIS_NUM_PREDICT
+    assert captured["payload"]["options"]["num_predict"] == 160
+    assert captured["payload"]["keep_alive"] == g1a.SYNTHESIS_KEEP_ALIVE
+    assert captured["timeout"] == g1a.SYNTHESIS_TIMEOUT_SECONDS
+
+
+def test_synthesize_with_ollama_rejects_malformed_non_empty_output(monkeypatch):
+    import plugins.memory.chromadb.g1a as g1a
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+        def read(self):
+            return json.dumps({"response": "<memory-profile source=\"chromadb\">\n- > \"truncated\""}).encode("utf-8")
+
+    monkeypatch.setattr(g1a.urllib.request, "urlopen", lambda req, timeout: FakeResponse())
+    with pytest.raises(g1a.MalformedOutput):
+        g1a.synthesize_with_ollama(prompt="prompt")
+
+
 def _provider(tmp_path, monkeypatch, *, boot_enabled=True):
     from plugins.memory.chromadb import ChromaDBMemoryProvider
     from plugins.memory.chromadb.config import ChromaDBConfig
@@ -204,6 +287,7 @@ def test_boot_synthesis_timeout_empty_and_unsafe_fallback_reasons(tmp_path, monk
         (g1a.ModelTimeout("slow"), "timeout"),
         (g1a.EmptyOutput("empty"), "empty_output"),
         (g1a.UnsafeOutput("bad"), "unsafe_output"),
+        (g1a.MalformedOutput("malformed"), "malformed_output"),
     ]
     for exc, reason in cases:
         p = _provider(tmp_path / reason, monkeypatch, boot_enabled=True)

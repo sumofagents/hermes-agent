@@ -33,6 +33,12 @@ RECENCY_WINDOW_SECONDS = 30 * 24 * 3600
 NEAR_DUPLICATE_THRESHOLD = 0.92
 SYNTHESIS_MODEL = "qwen2.5:7b"
 SYNTHESIS_TIMEOUT_SECONDS = 8.0
+SYNTHESIS_NUM_PREDICT = 160
+SYNTHESIS_KEEP_ALIVE = "5m"
+SYNTHESIS_FACT_CONTENT_CHARS = 120
+SYNTHESIS_FACT_ID_CHARS = 64
+SYNTHESIS_FACT_METADATA_CHARS = 32
+SYNTHESIS_PROMPT_INPUT_CHAR_CEILING = 2000
 
 assert abs((W_SIM + W_REC + W_SOURCE + W_IMPORTANCE + W_DURABILITY) - 1.0) < 1e-9
 
@@ -89,6 +95,9 @@ class ModelTimeout(ModelUnavailable):
 
 class EmptyOutput(ModelUnavailable):
     """The synthesis model returned no usable text."""
+
+class MalformedOutput(BootSynthesisError):
+    """The synthesis model returned no complete memory-profile block."""
 
 class UnsafeOutput(BootSynthesisError):
     """The synthesis model returned output unsafe for prompt insertion."""
@@ -378,19 +387,30 @@ def _unsafe_output(text: str) -> bool:
     return any(token in lowered for token in ["<system", "</system", "ignore previous instructions", "jailbreak"])
 
 
+def _extract_memory_profile(text: str) -> str:
+    match = re.search(r"<memory-profile\b[^>]*>[\s\S]*?</memory-profile>", text or "", re.IGNORECASE)
+    if not match:
+        raise MalformedOutput("missing complete memory-profile wrapper")
+    return match.group(0).strip()
+
+
 def synthesize_with_ollama(
     *,
     prompt: str,
     model: str = SYNTHESIS_MODEL,
     timeout: float = SYNTHESIS_TIMEOUT_SECONDS,
     host: str = "http://127.0.0.1:11434",
+    num_predict: int = SYNTHESIS_NUM_PREDICT,
+    keep_alive: str = SYNTHESIS_KEEP_ALIVE,
 ) -> str:
-    payload = json.dumps({
+    payload_obj = {
         "model": model,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.1, "num_predict": 220},
-    }).encode("utf-8")
+        "keep_alive": keep_alive,
+        "options": {"temperature": 0.1, "num_predict": int(num_predict)},
+    }
+    payload = json.dumps(payload_obj).encode("utf-8")
     req = urllib.request.Request(
         host.rstrip("/") + "/api/generate",
         data=payload,
@@ -416,6 +436,9 @@ def synthesize_with_ollama(
         raise EmptyOutput("empty synthesis response")
     if _unsafe_output(text):
         raise UnsafeOutput("unsafe synthesis response")
+    text = _extract_memory_profile(text)
+    if _unsafe_output(text):
+        raise UnsafeOutput("unsafe synthesis response")
     return text
 
 
@@ -435,26 +458,43 @@ def select_synthesis_candidates(candidates: Sequence[Dict[str, Any]], *, limit: 
 
 
 def build_synthesis_prompt(candidates: Sequence[Dict[str, Any]], *, max_chars: int = 2200) -> str:
-    facts = []
     # Keep boot latency bounded. Favor top-ranked facts, but force at least
     # one durable USER fact through when present so the boot block preserves
     # the contract's profile reachability guarantee.
     prompt_candidates = select_synthesis_candidates(candidates, limit=8)
-    for c in prompt_candidates:
-        facts.append({
-            "id": c.get("id"),
-            "target": (c.get("metadata") or {}).get("target"),
-            "durability": c.get("durability_label"),
-            "score": round(float(c.get("composite_score", 0.0)), 4),
-            "content": str(c.get("content") or "")[:260],
-        })
-    return (
+    prefix = (
         "Synthesize a concise Hermes boot memory profile from these Chroma facts. "
         "Return only a <memory-profile source=\"chromadb\" degraded=\"false\"> block with at most 8 short bullet lines of the form - > \"fact\". "
         f"Keep total output <= {max_chars} characters. Prefer durable USER facts. "
         "Do not include PR numbers, commit SHAs, task progress, or transient state.\n"
-        + json.dumps(facts, ensure_ascii=False, indent=2)
     )
+
+    def _clip(value: Any, limit: int) -> str:
+        return str(value or "")[:max(0, limit)]
+
+    def _render(content_chars: int) -> str:
+        facts = []
+        for c in prompt_candidates:
+            facts.append({
+                "id": _clip(c.get("id"), SYNTHESIS_FACT_ID_CHARS),
+                "target": _clip((c.get("metadata") or {}).get("target"), SYNTHESIS_FACT_METADATA_CHARS),
+                "durability": _clip(c.get("durability_label"), SYNTHESIS_FACT_METADATA_CHARS),
+                "score": round(float(c.get("composite_score", 0.0)), 4),
+                "content": str(c.get("content") or "")[:max(0, content_chars)],
+            })
+        return prefix + json.dumps(facts, ensure_ascii=False, separators=(",", ":"))
+
+    prompt = _render(SYNTHESIS_FACT_CONTENT_CHARS)
+    if len(prompt) <= SYNTHESIS_PROMPT_INPUT_CHAR_CEILING:
+        return prompt
+
+    overflow = len(prompt) - SYNTHESIS_PROMPT_INPUT_CHAR_CEILING
+    per_fact_reduction = math.ceil(overflow / max(1, len(prompt_candidates)))
+    prompt = _render(max(0, SYNTHESIS_FACT_CONTENT_CHARS - per_fact_reduction))
+    while len(prompt) > SYNTHESIS_PROMPT_INPUT_CHAR_CEILING and per_fact_reduction < SYNTHESIS_FACT_CONTENT_CHARS:
+        per_fact_reduction += 1
+        prompt = _render(max(0, SYNTHESIS_FACT_CONTENT_CHARS - per_fact_reduction))
+    return prompt
 
 
 def enforce_budget(text: str, max_chars: int) -> str:

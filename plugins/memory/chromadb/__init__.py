@@ -663,6 +663,9 @@ class ChromaDBMemoryProvider(MemoryProvider):
         except g1a.ModelUnavailable:
             legacy = self._build_legacy_generated_profile_block()
             return _finish(legacy, fallback=True, reason="model_unreachable", model=g1a.SYNTHESIS_MODEL)
+        except g1a.MalformedOutput:
+            legacy = self._build_legacy_generated_profile_block()
+            return _finish(legacy, fallback=True, reason="malformed_output", model=g1a.SYNTHESIS_MODEL)
         except g1a.UnsafeOutput:
             legacy = self._build_legacy_generated_profile_block()
             return _finish(legacy, fallback=True, reason="unsafe_output", model=g1a.SYNTHESIS_MODEL)
