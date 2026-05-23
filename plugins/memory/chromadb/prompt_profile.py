@@ -44,7 +44,7 @@ _INJECTION_PATTERNS: List[re.Pattern[str]] = [
     # Memory/context fences and closing variants
     re.compile(r"</?\s*memory-context\s*>", re.IGNORECASE),
     # Generated profile wrapper itself — facts must not be able to close it.
-    re.compile(r"</?\s*memory-profile\s*>", re.IGNORECASE),
+    re.compile(r"</?\s*memory-profile\b[^>]*>", re.IGNORECASE),
     # Bare <system> / </system>
     re.compile(r"</?\s*system\s*>", re.IGNORECASE),
     # ChatML / sentinel role tokens
@@ -61,7 +61,8 @@ _INJECTION_PATTERNS: List[re.Pattern[str]] = [
     re.compile(r"(?:^|\n)\s*###\s*Instruction\s*:", re.IGNORECASE),
     re.compile(r"(?:^|\n)\s*###\s*System\s*:", re.IGNORECASE),
     # Common jailbreak / override phrases
-    re.compile(r"ignore\s+(?:all|prior|previous)\s+(?:instructions|rules)", re.IGNORECASE),
+    re.compile(r"ignore\s+(?:all\s+)?(?:prior|previous)\s+(?:instructions|rules)", re.IGNORECASE),
+    re.compile(r"ignore\s+all\s+(?:instructions|rules)", re.IGNORECASE),
     re.compile(
         r"from\s+now\s+on\s+(?:you|the\s+assistant)\s+(?:must|will|are|should)",
         re.IGNORECASE,
