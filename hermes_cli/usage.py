@@ -145,15 +145,72 @@ def _print_summary_table(summary: dict[str, Any]) -> None:
             )
 
 
+def _usage_proof(args: Namespace) -> dict[str, Any]:
+    from agent.usage_ledger import UsageLedgerEvent, write_usage_span
+    from agent.usage_ledger_forge import (
+        build_forge_observer_packet,
+        write_forge_observer_packet,
+    )
+
+    ledger_path = Path(getattr(args, "path", None) or default_usage_ledger_path())
+    forge_packet_path = Path(
+        getattr(args, "out", None)
+        or (get_hermes_home() / "usage_ledger" / "forge-observer-proof.json")
+    )
+    event = UsageLedgerEvent(
+        event_id="evt_usage_ledger_local_proof",
+        trace_id="trace_usage_ledger_local_proof",
+        session_id="usage-ledger-local-proof",
+        source="cli",
+        provider="openai-codex",
+        model="gpt-5.5",
+        model_family="openai",
+        account_pool="openai_max",
+        runtime_adapter="codex_cli",
+        subscription_mode="session_subscription",
+        event_type="model_call",
+        status_class="success",
+        input_tokens=1,
+        output_tokens=1,
+        metadata={"check_kind": "synthetic_usage_ledger_local_check"},
+    )
+    result = write_usage_span(event, enabled=True, path=ledger_path)
+    rows = list(iter_usage_spans(ledger_path))
+    packet = build_forge_observer_packet(rows)
+    written = write_forge_observer_packet(packet, forge_packet_path)
+    return {
+        "span_written": result.written,
+        "ledger_path": str(result.path or ledger_path),
+        "forge_packet_path": str(written),
+        "forge_event_count": packet["event_count"],
+        "adapter_mode": packet["adapter_mode"],
+    }
+
+
 def usage_command(args: Namespace) -> int:
+    command = getattr(args, "usage_command", None) or "summary"
+    json_output = bool(getattr(args, "json", False))
+
+    if command == "proof":
+        proof = _usage_proof(args)
+        if json_output:
+            print(json.dumps(proof, indent=2, sort_keys=True))
+        else:
+            print(
+                "Usage ledger local proof wrote "
+                f"span={proof['span_written']} "
+                f"ledger={proof['ledger_path']} "
+                f"forge_packet={proof['forge_packet_path']} "
+                f"events={proof['forge_event_count']}"
+            )
+        return 0
+
     try:
         rows = read_usage_spans(args)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
-    command = getattr(args, "usage_command", None) or "summary"
-    json_output = bool(getattr(args, "json", False))
     if command == "spans":
         if json_output:
             print(json.dumps(rows, indent=2, sort_keys=True))
@@ -233,6 +290,22 @@ def register_usage_parser(subparsers) -> ArgumentParser:
         default=None,
         help="Output JSON packet path (default: $HERMES_HOME/usage_ledger/forge-observer.json)",
     )
+
+    proof = usage_subparsers.add_parser(
+        "proof",
+        help="Run a synthetic local proof of the ledger reader/writer/export path",
+        description=(
+            "Write one synthetic metadata-only span and a Forge observer packet. "
+            "This does not call a model, contact Forge, or mutate services."
+        ),
+    )
+    proof.add_argument("--path", default=None, help="Ledger JSONL path (default: $HERMES_HOME/usage_ledger/spans.jsonl)")
+    proof.add_argument(
+        "--out",
+        default=None,
+        help="Output JSON packet path (default: $HERMES_HOME/usage_ledger/forge-observer-proof.json)",
+    )
+    proof.add_argument("--json", action="store_true", help="Print machine-readable JSON")
 
     parser.set_defaults(func=lambda args: sys.exit(usage_command(args)), usage_command="summary")
     return parser
