@@ -57,6 +57,7 @@ from agent.prompt_caching import apply_anthropic_cache_control
 from agent.retry_utils import jittered_backoff
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_ledger import build_model_call_event, write_usage_span
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
@@ -1638,6 +1639,32 @@ def run_conversation(
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
                     agent.session_cost_status = cost_result.status
                     agent.session_cost_source = cost_result.source
+
+                    # Oracle usage ledger: disabled by default, metadata-only.
+                    # This writes append-only spans at the central post-response
+                    # accounting seam so Rilo/Forge reporting can grow without
+                    # provider-adapter instrumentation drift.
+                    try:
+                        write_usage_span(
+                            build_model_call_event(
+                                session_id=agent.session_id,
+                                provider=agent.provider,
+                                model=agent.model,
+                                api_mode=agent.api_mode,
+                                usage=canonical_usage,
+                                cost=cost_result,
+                                status_class="success",
+                                wall_ms=int(api_duration * 1000),
+                                source=agent.platform or "cli",
+                                base_url=agent.base_url,
+                            )
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            "Usage ledger span write failed (session=%s): %s",
+                            agent.session_id,
+                            e,
+                        )
 
                     # Persist token counts to session DB for /insights.
                     # Do this for every platform with a session_id so non-CLI

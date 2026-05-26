@@ -3997,6 +3997,13 @@ def cmd_status(args):
     show_status(args)
 
 
+def cmd_usage(args):
+    """Inspect local usage ledger spans."""
+    from hermes_cli.usage import usage_command
+
+    sys.exit(usage_command(args))
+
+
 def cmd_cron(args):
     """Cron job management."""
     from hermes_cli.cron import cron_command
@@ -10375,7 +10382,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "model", "pairing", "plugins", "portal", "postinstall", "profile", "proxy",
         "prompt-size",
         "send", "sessions", "setup",
-        "skills", "slack", "status", "tools", "uninstall", "update",
+        "skills", "slack", "status", "tools", "uninstall", "update", "usage",
         "version", "webhook", "whatsapp", "chat", "secrets", "security",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
@@ -10895,6 +10902,14 @@ def main():
     # model command  (parser built in hermes_cli/subcommands/model.py)
     # =========================================================================
     build_model_parser(subparsers, cmd_model=cmd_model)
+
+    # =========================================================================
+    # usage command — local metadata-only usage ledger reader
+    # =========================================================================
+    from hermes_cli.usage import register_usage_parser
+
+    usage_parser = register_usage_parser(subparsers)
+    usage_parser.set_defaults(func=cmd_usage, usage_command="summary")
 
     # =========================================================================
     # fallback command — manage the fallback provider chain
