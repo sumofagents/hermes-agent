@@ -6,6 +6,32 @@ from argparse import Namespace
 from hermes_cli.usage import usage_command
 
 
+def test_usage_forge_export_writes_observer_packet(tmp_path, capsys):
+    ledger = tmp_path / "usage_ledger" / "spans.jsonl"
+    out_path = tmp_path / "forge" / "usage-observer.json"
+    _write_span(ledger, event_id="evt_forge", provider="openai-codex", account_pool="openai_max")
+
+    exit_code = usage_command(
+        Namespace(
+            usage_command="forge-export",
+            path=str(ledger),
+            out=str(out_path),
+            provider=None,
+            account_pool=None,
+            session_id=None,
+            json=True,
+        )
+    )
+
+    assert exit_code == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["written"] == str(out_path)
+    packet = json.loads(out_path.read_text())
+    assert packet["observer"] == "forge"
+    assert packet["event_count"] == 1
+    assert packet["spans"][0]["event_id"] == "evt_forge"
+
+
 def _write_span(path, **overrides):
     payload = {
         "event_id": "evt_1",

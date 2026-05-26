@@ -169,6 +169,30 @@ def usage_command(args: Namespace) -> int:
             _print_summary_table(summary)
         return 0
 
+    if command == "forge-export":
+        from agent.usage_ledger_forge import (
+            build_forge_observer_packet,
+            write_forge_observer_packet,
+        )
+
+        out_path = Path(
+            getattr(args, "out", None)
+            or (get_hermes_home() / "usage_ledger" / "forge-observer.json")
+        )
+        packet = build_forge_observer_packet(rows)
+        written = write_forge_observer_packet(packet, out_path)
+        if json_output:
+            print(
+                json.dumps(
+                    {"written": str(written), "event_count": packet["event_count"]},
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(f"Wrote Forge observer packet: {written} ({packet['event_count']} spans)")
+        return 0
+
     print(f"unknown usage command: {command}", file=sys.stderr)
     return 2
 
@@ -194,6 +218,21 @@ def register_usage_parser(subparsers) -> ArgumentParser:
 
     summary = usage_subparsers.add_parser("summary", help="Summarize usage ledger spans")
     add_common_args(summary)
+
+    forge = usage_subparsers.add_parser(
+        "forge-export",
+        help="Write a metadata-only local packet for a Forge observer",
+        description=(
+            "Export usage spans to a metadata-only JSON packet. "
+            "This does not contact Forge or mutate services."
+        ),
+    )
+    add_common_args(forge)
+    forge.add_argument(
+        "--out",
+        default=None,
+        help="Output JSON packet path (default: $HERMES_HOME/usage_ledger/forge-observer.json)",
+    )
 
     parser.set_defaults(func=lambda args: sys.exit(usage_command(args)), usage_command="summary")
     return parser
