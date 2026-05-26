@@ -162,6 +162,7 @@ from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_ledger import build_model_call_event, write_usage_span
 from agent.codex_responses_adapter import (
     _derive_responses_function_call_id as _codex_derive_responses_function_call_id,
     _deterministic_call_id as _codex_deterministic_call_id,
@@ -13798,6 +13799,32 @@ class AIAgent:
                             self.session_estimated_cost_usd += float(cost_result.amount_usd)
                         self.session_cost_status = cost_result.status
                         self.session_cost_source = cost_result.source
+
+                        # Oracle usage ledger: disabled by default, metadata-only.
+                        # This writes append-only spans at the central post-response
+                        # accounting seam so Rilo/Forge reporting can grow without
+                        # provider-adapter instrumentation drift.
+                        try:
+                            write_usage_span(
+                                build_model_call_event(
+                                    session_id=self.session_id,
+                                    provider=self.provider,
+                                    model=self.model,
+                                    api_mode=self.api_mode,
+                                    usage=canonical_usage,
+                                    cost=cost_result,
+                                    status_class="success",
+                                    wall_ms=int(api_duration * 1000),
+                                    source=self.platform or "cli",
+                                    base_url=self.base_url,
+                                )
+                            )
+                        except Exception as e:
+                            logger.debug(
+                                "Usage ledger span write failed (session=%s): %s",
+                                self.session_id,
+                                e,
+                            )
 
                         # Persist token counts to session DB for /insights.
                         # Do this for every platform with a session_id so non-CLI
