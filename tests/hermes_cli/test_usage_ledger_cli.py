@@ -32,6 +32,48 @@ def test_usage_forge_export_writes_observer_packet(tmp_path, capsys):
     assert packet["spans"][0]["event_id"] == "evt_forge"
 
 
+
+def test_usage_forge_observe_exports_incremental_packet_with_state(tmp_path, capsys):
+    ledger = tmp_path / "usage_ledger" / "spans.jsonl"
+    packet_dir = tmp_path / "forge_packets"
+    state_path = tmp_path / "forge_state.json"
+    _write_span(ledger, event_id="evt_a", provider="openai-codex", account_pool="openai_max")
+    _write_span(ledger, event_id="evt_b", provider="openrouter", account_pool="openrouter_prepay")
+
+    exit_code = usage_command(
+        Namespace(
+            usage_command="forge-observe",
+            path=str(ledger),
+            packet_dir=str(packet_dir),
+            state=str(state_path),
+            json=True,
+        )
+    )
+
+    assert exit_code == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["written"] is True
+    assert printed["event_count"] == 2
+    packet = json.loads(open(printed["packet_path"], encoding="utf-8").read())
+    assert [row["event_id"] for row in packet["spans"]] == ["evt_a", "evt_b"]
+    assert json.loads(state_path.read_text())["last_event_id"] == "evt_b"
+
+    exit_code = usage_command(
+        Namespace(
+            usage_command="forge-observe",
+            path=str(ledger),
+            packet_dir=str(packet_dir),
+            state=str(state_path),
+            json=True,
+        )
+    )
+
+    assert exit_code == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["written"] is False
+    assert printed["event_count"] == 0
+
+
 def test_usage_proof_writes_synthetic_span_and_forge_packet(tmp_path, capsys):
     ledger = tmp_path / "usage_ledger" / "spans.jsonl"
     out_path = tmp_path / "forge" / "usage-proof.json"
