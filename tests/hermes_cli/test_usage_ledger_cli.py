@@ -32,6 +32,45 @@ def test_usage_forge_export_writes_observer_packet(tmp_path, capsys):
     assert packet["spans"][0]["event_id"] == "evt_forge"
 
 
+def test_usage_proof_writes_synthetic_span_and_forge_packet(tmp_path, capsys):
+    ledger = tmp_path / "usage_ledger" / "spans.jsonl"
+    out_path = tmp_path / "forge" / "usage-proof.json"
+
+    exit_code = usage_command(
+        Namespace(
+            usage_command="proof",
+            path=str(ledger),
+            out=str(out_path),
+            provider=None,
+            account_pool=None,
+            session_id=None,
+            json=True,
+        )
+    )
+
+    assert exit_code == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["span_written"] is True
+    assert printed["ledger_path"] == str(ledger)
+    assert printed["forge_packet_path"] == str(out_path)
+    assert printed["forge_event_count"] == 1
+
+    span = json.loads(ledger.read_text())
+    assert span["event_id"] == "evt_usage_ledger_local_proof"
+    assert span["provider"] == "openai-codex"
+    assert span["account_pool"] == "openai_max"
+    assert span["metadata"] == {"check_kind": "synthetic_usage_ledger_local_check"}
+    serialized_span = json.dumps(span).lower()
+    assert "prompt" not in serialized_span
+    assert "response" not in serialized_span
+    assert "secret" not in serialized_span
+
+    packet = json.loads(out_path.read_text())
+    assert packet["adapter_mode"] == "observer_only_file_export"
+    assert packet["event_count"] == 1
+    assert packet["spans"][0]["event_id"] == "evt_usage_ledger_local_proof"
+
+
 def _write_span(path, **overrides):
     payload = {
         "event_id": "evt_1",
