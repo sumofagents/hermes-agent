@@ -250,6 +250,39 @@ def usage_command(args: Namespace) -> int:
             print(f"Wrote Forge observer packet: {written} ({packet['event_count']} spans)")
         return 0
 
+    if command == "forge-observe":
+        from agent.usage_ledger_forge import ForgeObserverAdapter
+
+        ledger_path = Path(getattr(args, "path", None) or default_usage_ledger_path())
+        packet_dir = Path(
+            getattr(args, "packet_dir", None)
+            or (get_hermes_home() / "usage_ledger" / "forge-observer-packets")
+        )
+        state_path = Path(
+            getattr(args, "state", None)
+            or (get_hermes_home() / "usage_ledger" / "forge-observer-state.json")
+        )
+        result = ForgeObserverAdapter(
+            ledger_path=ledger_path,
+            packet_dir=packet_dir,
+            state_path=state_path,
+        ).export_new_spans()
+        payload = {
+            "written": result.written,
+            "event_count": result.event_count,
+            "packet_path": str(result.packet_path),
+            "state_path": str(result.state_path),
+            "adapter_mode": result.adapter_mode,
+            "network_io": result.network_io,
+        }
+        if json_output:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        elif result.written:
+            print(f"Wrote Forge observer packet: {result.packet_path} ({result.event_count} new spans)")
+        else:
+            print("No new usage spans for Forge observer export.")
+        return 0
+
     print(f"unknown usage command: {command}", file=sys.stderr)
     return 2
 
@@ -290,6 +323,27 @@ def register_usage_parser(subparsers) -> ArgumentParser:
         default=None,
         help="Output JSON packet path (default: $HERMES_HOME/usage_ledger/forge-observer.json)",
     )
+
+    observe = usage_subparsers.add_parser(
+        "forge-observe",
+        help="Export only new usage spans for a local Forge observer",
+        description=(
+            "Read the local usage ledger, write a metadata-only packet containing only spans "
+            "after the observer cursor, and update local cursor state. This performs no network I/O."
+        ),
+    )
+    observe.add_argument("--path", default=None, help="Ledger JSONL path (default: $HERMES_HOME/usage_ledger/spans.jsonl)")
+    observe.add_argument(
+        "--packet-dir",
+        default=None,
+        help="Directory for observer packets (default: $HERMES_HOME/usage_ledger/forge-observer-packets)",
+    )
+    observe.add_argument(
+        "--state",
+        default=None,
+        help="Observer cursor state path (default: $HERMES_HOME/usage_ledger/forge-observer-state.json)",
+    )
+    observe.add_argument("--json", action="store_true", help="Print machine-readable JSON")
 
     proof = usage_subparsers.add_parser(
         "proof",

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from agent.usage_ledger_forge import build_forge_observer_packet
+from agent.usage_ledger_forge import ForgeObserverAdapter, build_forge_observer_packet
 
 
 def test_forge_observer_packet_is_metadata_only_and_aggregates():
@@ -61,3 +61,49 @@ def test_forge_observer_packet_is_metadata_only_and_aggregates():
     assert "raw prompt" not in serialized
     assert "raw response" not in serialized
     assert "secret" not in serialized
+
+
+def test_forge_observer_adapter_exports_only_new_spans_and_updates_cursor(tmp_path):
+    ledger = tmp_path / "usage_ledger" / "spans.jsonl"
+    packet_dir = tmp_path / "forge_packets"
+    state_path = tmp_path / "forge_observer_state.json"
+    _append_jsonl(ledger, {"event_id": "evt_1", "provider": "openai-codex", "account_pool": "openai_max", "input_tokens": 10})
+    _append_jsonl(ledger, {"event_id": "evt_2", "provider": "openrouter", "account_pool": "openrouter_prepay", "input_tokens": 5})
+
+    adapter = ForgeObserverAdapter(
+        ledger_path=ledger,
+        packet_dir=packet_dir,
+        state_path=state_path,
+        source_host="macbook",
+    )
+
+    first = adapter.export_new_spans()
+
+    assert first.written is True
+    assert first.event_count == 2
+    assert first.adapter_mode == "observer_only_file_export"
+    assert first.network_io is False
+    first_packet = json.loads(first.packet_path.read_text())
+    assert [row["event_id"] for row in first_packet["spans"]] == ["evt_1", "evt_2"]
+    state = json.loads(state_path.read_text())
+    assert state["last_event_id"] == "evt_2"
+
+    _append_jsonl(ledger, {"event_id": "evt_3", "provider": "claude-cli", "account_pool": "anthropic_max", "input_tokens": 3})
+    second = adapter.export_new_spans()
+
+    assert second.written is True
+    assert second.event_count == 1
+    second_packet = json.loads(second.packet_path.read_text())
+    assert [row["event_id"] for row in second_packet["spans"]] == ["evt_3"]
+    assert json.loads(state_path.read_text())["last_event_id"] == "evt_3"
+
+    third = adapter.export_new_spans()
+
+    assert third.written is False
+    assert third.event_count == 0
+
+
+def _append_jsonl(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload) + "\n")

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import socket
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,79 @@ _TOKEN_FIELDS = (
 )
 
 
+@dataclass(frozen=True)
+class ForgeObserverExportResult:
+    """Result from an observer-only local Forge export cycle."""
+
+    written: bool
+    event_count: int
+    packet_path: Path
+    state_path: Path
+    adapter_mode: str = "observer_only_file_export"
+    network_io: bool = False
+
+
+class ForgeObserverAdapter:
+    """Stateful, file-only Forge observer adapter for local usage spans.
+
+    The adapter reads the append-only local ledger, writes sanitized packet files,
+    and advances a cursor. It intentionally performs no network I/O and cannot
+    mutate Forge, Sentinel, Manifold, Workspace, routing policy, or budgets.
+    """
+
+    def __init__(
+        self,
+        *,
+        ledger_path: str | Path,
+        packet_dir: str | Path,
+        state_path: str | Path,
+        source_host: str | None = None,
+        max_spans: int = 1000,
+    ) -> None:
+        self.ledger_path = Path(ledger_path)
+        self.packet_dir = Path(packet_dir)
+        self.state_path = Path(state_path)
+        self.source_host = source_host
+        self.max_spans = max_spans
+
+    def export_new_spans(self) -> ForgeObserverExportResult:
+        rows = _read_jsonl(self.ledger_path)
+        state = _read_state(self.state_path)
+        new_rows = _rows_after_event_id(rows, state.get("last_event_id"))
+        if not new_rows:
+            return ForgeObserverExportResult(
+                written=False,
+                event_count=0,
+                packet_path=self.packet_dir / "forge-observer-noop.json",
+                state_path=self.state_path,
+            )
+
+        packet = build_forge_observer_packet(
+            new_rows,
+            source_host=self.source_host,
+            max_spans=self.max_spans,
+        )
+        packet_path = self.packet_dir / _packet_filename(packet["generated_at"])
+        written = write_forge_observer_packet(packet, packet_path)
+        _write_state(
+            self.state_path,
+            {
+                "schema_version": 1,
+                "adapter_mode": "observer_only_file_export",
+                "last_event_id": new_rows[-1].get("event_id"),
+                "last_exported_at": packet["generated_at"],
+                "last_packet_path": str(written),
+                "network_io": False,
+            },
+        )
+        return ForgeObserverExportResult(
+            written=True,
+            event_count=packet["event_count"],
+            packet_path=written,
+            state_path=self.state_path,
+        )
+
+
 def build_forge_observer_packet(
     spans: list[dict[str, Any]],
     *,
@@ -93,6 +167,47 @@ def write_forge_observer_packet(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(packet, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return out_path
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            raw = line.strip()
+            if not raw:
+                continue
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                rows.append(payload)
+    return rows
+
+
+def _read_state(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_state(path: Path, state: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _rows_after_event_id(rows: list[dict[str, Any]], last_event_id: Any) -> list[dict[str, Any]]:
+    if not last_event_id:
+        return rows
+    for index, row in enumerate(rows):
+        if row.get("event_id") == last_event_id:
+            return rows[index + 1 :]
+    return rows
+
+
+def _packet_filename(generated_at: str) -> str:
+    safe = generated_at.replace(":", "").replace("+", "Z").replace(".", "-")
+    return f"forge-observer-{safe}.json"
 
 
 def _sanitize_span(row: dict[str, Any]) -> dict[str, Any]:
