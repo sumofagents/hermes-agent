@@ -24,6 +24,8 @@ Pure helpers that read the agent's state.  AIAgent keeps thin forwarders.
 from __future__ import annotations
 
 import json
+import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
@@ -42,6 +44,86 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_MODELS,
 )
 from agent.runtime_cwd import resolve_context_cwd
+
+
+logger = logging.getLogger(__name__)
+
+_PROVIDER_UNAVAILABLE_MARKER = "# Memory Provider Unavailable — no profile loaded this session"
+_MEMORY_PROFILE_OPEN_RE = re.compile(r"^\s*<memory-profile\b[^>]*>", re.IGNORECASE)
+_DEGRADED_FALSE_RE = re.compile(r"\bdegraded\s*=\s*['\"]false['\"]", re.IGNORECASE)
+_DEGRADED_TRUE_RE = re.compile(r"\bdegraded\s*=\s*['\"]true['\"]", re.IGNORECASE)
+
+
+def _external_memory_prompt_block(agent: Any) -> str:
+    """Return the external memory provider block used for prompt-source policy."""
+    manager = getattr(agent, "_memory_manager", None)
+    if manager is None:
+        return ""
+    external_block = getattr(manager, "external_system_prompt_block", None)
+    if callable(external_block):
+        try:
+            block = external_block()
+            return block if isinstance(block, str) else ""
+        except Exception as exc:
+            logger.warning("External memory provider prompt block failed: %s", exc)
+            return ""
+    try:
+        block = manager.build_system_prompt()
+        return block if isinstance(block, str) else ""
+    except Exception as exc:
+        logger.warning("Memory provider prompt block failed: %s", exc)
+        return ""
+
+
+def _is_non_degraded_memory_profile(block: str) -> bool:
+    """Return True only for a top-level non-degraded generated profile block.
+
+    Status text or team-memory prose that merely mentions ``<memory-profile>``
+    must not suppress legacy MEMORY/USER.md.  Generated profile blocks are
+    wrapped at the start of the provider output and explicitly carry
+    ``degraded=\"false\"``; degraded or malformed blocks remain additive so
+    legacy flat-file memory can act as fallback.
+    """
+    if not block or not block.strip():
+        return False
+    open_match = _MEMORY_PROFILE_OPEN_RE.match(block)
+    if not open_match:
+        return False
+    opening_tag = open_match.group(0)
+    if _DEGRADED_TRUE_RE.search(opening_tag):
+        return False
+    return bool(_DEGRADED_FALSE_RE.search(opening_tag))
+
+
+def _memory_prompt_policy(agent: Any) -> tuple[bool, str]:
+    """Return ``(suppress_legacy_flat_files, marker_to_insert)``.
+
+    This policy is intentionally provider-agnostic: core only sees opaque
+    provider text and the generated-profile wrapper contract.
+    """
+    prompt_source = (getattr(agent, "_memory_prompt_source", "legacy") or "legacy").strip()
+    external_block = _external_memory_prompt_block(agent)
+    external_non_degraded = _is_non_degraded_memory_profile(external_block)
+
+    if prompt_source == "provider":
+        if external_non_degraded:
+            return True, ""
+        if external_block and external_block.strip():
+            # Degraded/status provider output is additive; keep legacy fallback.
+            return False, ""
+        logger.warning(_PROVIDER_UNAVAILABLE_MARKER)
+        return True, _PROVIDER_UNAVAILABLE_MARKER
+
+    if prompt_source == "provider_with_legacy_fallback":
+        return external_non_degraded, ""
+
+    if prompt_source == "legacy" and bool(
+        getattr(agent, "_memory_suppress_builtin_when_external", False)
+    ):
+        return external_non_degraded, ""
+
+    # legacy/shadow/unknown keep legacy flat-file memory additive.
+    return False, ""
 
 
 def _ra():
@@ -306,18 +388,25 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # ── Volatile tier (changes per session/turn — never cached) ───
     volatile_parts: List[str] = []
 
-    if agent._memory_store:
+    suppress_legacy_memory, memory_provider_marker = _memory_prompt_policy(agent)
+
+    if memory_provider_marker:
+        volatile_parts.append(memory_provider_marker)
+
+    if agent._memory_store and not suppress_legacy_memory:
         if agent._memory_enabled:
             mem_block = agent._memory_store.format_for_system_prompt("memory")
             if mem_block:
                 volatile_parts.append(mem_block)
-        # USER.md is always included when enabled.
+        # USER.md is always included when enabled unless provider policy
+        # deliberately suppresses legacy flat-file memory/profile blocks.
         if agent._user_profile_enabled:
             user_block = agent._memory_store.format_for_system_prompt("user")
             if user_block:
                 volatile_parts.append(user_block)
 
-    # External memory provider system prompt block (additive to built-in)
+    # External memory provider system prompt block (additive unless provider
+    # policy used it to replace legacy flat-file memory/profile blocks).
     if agent._memory_manager:
         try:
             _ext_mem_block = agent._memory_manager.build_system_prompt()
