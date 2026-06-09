@@ -94,6 +94,50 @@ class GeneratedProfileConfig:
 
 
 @dataclass
+class AtlasFIRuntimeConfig:
+    """Provider-local Atlas FI pullback reranking controls.
+
+    Disabled by default for upstream-safe behavior. Jeremiah's default profile
+    enables it in chromadb.json when Rilo should use the Atlas FI chart at
+    runtime.
+    """
+
+    enabled: bool = False
+    score_weight: float = 0.35
+    candidate_multiplier: int = 4
+    max_candidates: int = 80
+    min_candidates: int = 3
+    annotate_results: bool = True
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, Any]]) -> "AtlasFIRuntimeConfig":
+        if not data or not isinstance(data, dict):
+            return cls()
+        try:
+            return cls(
+                enabled=bool(data.get("enabled", False)),
+                score_weight=float(data.get("score_weight", 0.35)),
+                candidate_multiplier=max(1, int(data.get("candidate_multiplier", 4))),
+                max_candidates=max(1, int(data.get("max_candidates", 80))),
+                min_candidates=max(1, int(data.get("min_candidates", 3))),
+                annotate_results=bool(data.get("annotate_results", True)),
+            )
+        except (TypeError, ValueError) as e:
+            logger.debug("Invalid atlas_fi_runtime keys, using defaults: %s", e)
+            return cls()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "score_weight": self.score_weight,
+            "candidate_multiplier": self.candidate_multiplier,
+            "max_candidates": self.max_candidates,
+            "min_candidates": self.min_candidates,
+            "annotate_results": self.annotate_results,
+        }
+
+
+@dataclass
 class ChromaDBConfig:
     """Configuration for the ChromaDB vector memory plugin."""
 
@@ -124,6 +168,8 @@ class ChromaDBConfig:
     agent_name: str = "rilo"
     # Provider-local tuning for the generated profile block (Phase 1 / Lane B)
     generated_profile: GeneratedProfileConfig = field(default_factory=GeneratedProfileConfig)
+    # Atlas FI pullback runtime reranking over bounded Chroma candidate sets.
+    atlas_fi_runtime: AtlasFIRuntimeConfig = field(default_factory=AtlasFIRuntimeConfig)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ChromaDBConfig":
@@ -158,6 +204,7 @@ class ChromaDBConfig:
             default_char_budget=int(data.get("default_char_budget", 2200)),
             agent_name=str(data.get("agent_name", "rilo")),
             generated_profile=GeneratedProfileConfig.from_dict(data.get("generated_profile")),
+            atlas_fi_runtime=AtlasFIRuntimeConfig.from_dict(data.get("atlas_fi_runtime")),
         )
 
     @classmethod
@@ -191,4 +238,5 @@ class ChromaDBConfig:
             "default_char_budget": self.default_char_budget,
             "agent_name": self.agent_name,
             "generated_profile": self.generated_profile.to_dict(),
+            "atlas_fi_runtime": self.atlas_fi_runtime.to_dict(),
         }

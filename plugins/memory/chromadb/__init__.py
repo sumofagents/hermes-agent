@@ -363,6 +363,48 @@ class ChromaDBMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.debug("Failed to load team context: %s", e)
 
+    # -- Atlas FI runtime reranking -----------------------------------------
+
+    def _atlas_fi_cfg(self):
+        if self._config is None:
+            return None
+        return getattr(self._config, "atlas_fi_runtime", None)
+
+    def _atlas_fi_enabled(self) -> bool:
+        cfg = self._atlas_fi_cfg()
+        return bool(cfg and getattr(cfg, "enabled", False))
+
+    def _atlas_fi_query_count(self, requested: int) -> int:
+        cfg = self._atlas_fi_cfg()
+        if not cfg or not getattr(cfg, "enabled", False):
+            return requested
+        try:
+            return min(
+                int(getattr(cfg, "max_candidates", 80)),
+                max(int(requested), int(requested) * int(getattr(cfg, "candidate_multiplier", 4))),
+            )
+        except Exception:
+            return requested
+
+    def _atlas_fi_rerank(self, query: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        cfg = self._atlas_fi_cfg()
+        if not cfg or not getattr(cfg, "enabled", False) or not query or not rows:
+            return rows
+        try:
+            if len(rows) < int(getattr(cfg, "min_candidates", 3)):
+                return rows
+            from plugins.memory.chromadb.atlas_fi import rerank_rows
+            return rerank_rows(
+                query,
+                rows,
+                score_weight=float(getattr(cfg, "score_weight", 0.35)),
+                max_candidates=int(getattr(cfg, "max_candidates", 80)),
+                annotate=bool(getattr(cfg, "annotate_results", True)),
+            )
+        except Exception as e:
+            logger.debug("Atlas FI runtime rerank failed: %s", e)
+            return rows
+
     # -- System prompt block ------------------------------------------------
 
     def system_prompt_block(self) -> str:
@@ -389,6 +431,12 @@ class ChromaDBMemoryProvider(MemoryProvider):
             "Active. Semantic search across 7 collections. Use team_memory and "
             "vector_search tools to store/retrieve knowledge."
         )
+        if self._atlas_fi_enabled():
+            parts.append(
+                "\n## Atlas FI Runtime Memory\n"
+                "Active. Chroma candidate sets are reranked by the Atlas finite "
+                "claim/event + valid-abstraction FI pullback chart before runtime recall."
+            )
 
         if self._team_context:
             parts.append(f"\n## Team Knowledge\n{self._team_context}")
@@ -1071,15 +1119,24 @@ class ChromaDBMemoryProvider(MemoryProvider):
                     own = self.search_agent_memory(query, agent_name=agent_name, n_results=5)
                     results = tk + own
 
-                results.sort(key=lambda x: x.get("distance", 999.0))
+                scored = self._score_results(results)
+                scored = self._atlas_fi_rerank(query, scored)
+                scored.sort(key=lambda x: x.get("composite_score", 0), reverse=True)
 
                 entries = []
-                for r in results[:10]:
-                    entries.append({
+                for r in scored[:10]:
+                    entry = {
                         "content": r.get("content", ""),
-                        "score": round(1.0 / (1.0 + r.get("distance", 1.0)), 4),
+                        "score": round(r.get("composite_score", 0), 4),
                         "metadata": r.get("metadata", {}),
-                    })
+                    }
+                    if "atlas_fi_score" in r:
+                        entry["atlas_fi"] = {
+                            "score": round(float(r.get("atlas_fi_score", 0.0) or 0.0), 4),
+                            "distance": round(float(r.get("atlas_fi_distance", 0.0) or 0.0), 4),
+                            "penalty": round(float(r.get("atlas_fi_penalty", 0.0) or 0.0), 4),
+                        }
+                    entries.append(entry)
 
                 return json.dumps({"status": "ok", "results": entries, "count": len(entries)})
 
@@ -1113,16 +1170,24 @@ class ChromaDBMemoryProvider(MemoryProvider):
                 results = self.search_memories(query, "memory", n_results=n_results)
 
             scored = self._score_results(results)
-            scored.sort(key=lambda x: x["composite_score"], reverse=True)
+            scored = self._atlas_fi_rerank(query, scored)
+            scored.sort(key=lambda x: x.get("composite_score", 0), reverse=True)
 
             entries = []
             for r in scored[:n_results]:
-                entries.append({
+                entry = {
                     "content": r.get("content", ""),
                     "score": round(r.get("composite_score", 0), 4),
                     "similarity": round(r.get("similarity", 0), 4),
                     "metadata": r.get("metadata", {}),
-                })
+                }
+                if "atlas_fi_score" in r:
+                    entry["atlas_fi"] = {
+                        "score": round(float(r.get("atlas_fi_score", 0.0) or 0.0), 4),
+                        "distance": round(float(r.get("atlas_fi_distance", 0.0) or 0.0), 4),
+                        "penalty": round(float(r.get("atlas_fi_penalty", 0.0) or 0.0), 4),
+                    }
+                entries.append(entry)
 
             return json.dumps({"status": "ok", "results": entries, "count": len(entries)})
 
@@ -1421,8 +1486,11 @@ class ChromaDBMemoryProvider(MemoryProvider):
                 return []
 
             where_filter = {"target": target}
-            results = self._query(collection, query, n_results=n_results, where=where_filter)
-            return self._format_results(results)
+            query_count = self._atlas_fi_query_count(n_results)
+            results = self._query(collection, query, n_results=query_count, where=where_filter)
+            rows = self._format_results(results)
+            rows = self._atlas_fi_rerank(query, rows)
+            return rows[:n_results]
         except Exception as e:
             logger.warning("search_memories failed: %s", e)
             return []
@@ -1454,7 +1522,8 @@ class ChromaDBMemoryProvider(MemoryProvider):
                 return ""
 
             scored = self._score_results(raw)
-            scored.sort(key=lambda x: x["composite_score"], reverse=True)
+            scored = self._atlas_fi_rerank(query, scored)
+            scored.sort(key=lambda x: x.get("composite_score", 0), reverse=True)
 
             entries = []
             total_chars = 0
@@ -1511,8 +1580,11 @@ class ChromaDBMemoryProvider(MemoryProvider):
             collection = self._collections.get("sessions")
             if collection is None:
                 return []
-            results = self._query(collection, query, n_results=n_results)
-            return self._format_results(results)
+            query_count = self._atlas_fi_query_count(n_results)
+            results = self._query(collection, query, n_results=query_count)
+            rows = self._format_results(results)
+            rows = self._atlas_fi_rerank(query, rows)
+            return rows[:n_results]
         except Exception as e:
             logger.warning("search_sessions failed: %s", e)
             return []
@@ -1552,8 +1624,11 @@ class ChromaDBMemoryProvider(MemoryProvider):
             collection = self._collections.get("team_knowledge")
             if collection is None:
                 return []
-            results = self._query(collection, query, n_results=n_results)
-            return self._format_results(results)
+            query_count = self._atlas_fi_query_count(n_results)
+            results = self._query(collection, query, n_results=query_count)
+            rows = self._format_results(results)
+            rows = self._atlas_fi_rerank(query, rows)
+            return rows[:n_results]
         except Exception as e:
             logger.warning("search_team_knowledge failed: %s", e)
             return []
@@ -1595,8 +1670,11 @@ class ChromaDBMemoryProvider(MemoryProvider):
             where_filter = None
             if agent_name:
                 where_filter = {"agent_name": agent_name}
-            results = self._query(collection, query, n_results=n_results, where=where_filter)
-            return self._format_results(results)
+            query_count = self._atlas_fi_query_count(n_results)
+            results = self._query(collection, query, n_results=query_count, where=where_filter)
+            rows = self._format_results(results)
+            rows = self._atlas_fi_rerank(query, rows)
+            return rows[:n_results]
         except Exception as e:
             logger.warning("search_team_ops failed: %s", e)
             return []
@@ -1637,8 +1715,11 @@ class ChromaDBMemoryProvider(MemoryProvider):
             collection = self._collections.get(col_key)
             if collection is None:
                 return []
-            results = self._query(collection, query, n_results=n_results)
-            return self._format_results(results)
+            query_count = self._atlas_fi_query_count(n_results)
+            results = self._query(collection, query, n_results=query_count)
+            rows = self._format_results(results)
+            rows = self._atlas_fi_rerank(query, rows)
+            return rows[:n_results]
         except Exception as e:
             logger.warning("search_agent_memory failed for %s: %s", agent_name, e)
             return []
@@ -1661,7 +1742,8 @@ class ChromaDBMemoryProvider(MemoryProvider):
                 if collection is None:
                     continue
                 try:
-                    raw = self._query(collection, query, n_results=n_results)
+                    query_count = self._atlas_fi_query_count(n_results)
+                    raw = self._query(collection, query, n_results=query_count)
                     formatted = self._format_results(raw)
                     for r in formatted:
                         r["source_collection"] = key
@@ -1670,6 +1752,7 @@ class ChromaDBMemoryProvider(MemoryProvider):
                     continue
 
             all_results.sort(key=lambda x: x.get("distance", 999.0))
+            all_results = self._atlas_fi_rerank(query, all_results)
             return all_results
         except Exception as e:
             logger.warning("search_all_accessible failed: %s", e)
