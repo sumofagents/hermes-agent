@@ -49,7 +49,12 @@ from agent.runtime_cwd import resolve_context_cwd
 logger = logging.getLogger(__name__)
 
 _PROVIDER_UNAVAILABLE_MARKER = "# Memory Provider Unavailable — no profile loaded this session"
-_MEMORY_PROFILE_OPEN_RE = re.compile(r"^\s*<memory-profile\b[^>]*>", re.IGNORECASE)
+_MEMORY_PROFILE_OPEN_RE = re.compile(
+    r"^[ \t]*(<memory-profile\b[^>]*>)[ \t]*$", re.IGNORECASE | re.MULTILINE
+)
+_MEMORY_PROFILE_CLOSE_RE = re.compile(
+    r"^[ \t]*</memory-profile>[ \t]*$", re.IGNORECASE | re.MULTILINE
+)
 _DEGRADED_FALSE_RE = re.compile(r"\bdegraded\s*=\s*['\"]false['\"]", re.IGNORECASE)
 _DEGRADED_TRUE_RE = re.compile(r"\bdegraded\s*=\s*['\"]true['\"]", re.IGNORECASE)
 
@@ -75,21 +80,52 @@ def _external_memory_prompt_block(agent: Any) -> str:
         return ""
 
 
+def _extract_final_memory_profile(block: str) -> Optional[tuple[str, str]]:
+    """Return ``(opening_tag, body)`` for a complete final profile block.
+
+    Providers may prepend status/provenance/team-memory prose before their
+    generated profile.  Only a top-level ``<memory-profile>`` line that has a
+    matching closing line and is the final substantive block is eligible;
+    inline mentions or incomplete tags in arbitrary prose remain additive and
+    must not suppress legacy MEMORY/USER.md.
+    """
+    if not block or not block.strip():
+        return None
+
+    # Prefer the last complete top-level profile block.  Generated Chroma
+    # profiles are appended after provider status/team context; requiring the
+    # closing tag to be at the tail prevents earlier prose mentions from
+    # spoofing replacement readiness.
+    for open_match in reversed(list(_MEMORY_PROFILE_OPEN_RE.finditer(block))):
+        tail = block[open_match.end():]
+        close_match = _MEMORY_PROFILE_CLOSE_RE.search(tail)
+        if not close_match:
+            continue
+        if tail[close_match.end():].strip():
+            continue
+        body = tail[:close_match.start()]
+        if not body.strip():
+            continue
+        if _MEMORY_PROFILE_OPEN_RE.search(body):
+            continue
+        return open_match.group(1), body
+    return None
+
+
 def _is_non_degraded_memory_profile(block: str) -> bool:
-    """Return True only for a top-level non-degraded generated profile block.
+    """Return True only for a complete non-degraded generated profile block.
 
     Status text or team-memory prose that merely mentions ``<memory-profile>``
-    must not suppress legacy MEMORY/USER.md.  Generated profile blocks are
-    wrapped at the start of the provider output and explicitly carry
+    must not suppress legacy MEMORY/USER.md.  Generated profile blocks may be
+    preceded by provider-owned status/team context, but the profile wrapper
+    itself must be a complete top-level final block and explicitly carry
     ``degraded=\"false\"``; degraded or malformed blocks remain additive so
     legacy flat-file memory can act as fallback.
     """
-    if not block or not block.strip():
+    profile = _extract_final_memory_profile(block)
+    if profile is None:
         return False
-    open_match = _MEMORY_PROFILE_OPEN_RE.match(block)
-    if not open_match:
-        return False
-    opening_tag = open_match.group(0)
+    opening_tag, _body = profile
     if _DEGRADED_TRUE_RE.search(opening_tag):
         return False
     return bool(_DEGRADED_FALSE_RE.search(opening_tag))

@@ -260,6 +260,53 @@ class TestPromptSourceProviderWithLegacyFallback:
         # Provider block still present.
         assert "User Profile Snapshot (vector-memory derived)" in volatile
 
+    def test_provider_with_fallback_suppresses_builtin_for_prefixed_chromadb_provider_block(self):
+        """Real Chroma provider output has status/team prose before the profile.
+
+        The replacement decision must recognize the provider-owned generated
+        profile at the end of the external provider block, not only a fake
+        block that starts directly with ``<memory-profile>``.
+        """
+        prefixed_block = (
+            "# ChromaDB Vector Memory\n"
+            "Active. Semantic search across 7 collections. Use team_memory and "
+            "vector_search tools to store/retrieve knowledge.\n\n"
+            "## Team Knowledge\n"
+            "- durable shared infra fact\n"
+            f"{_NON_DEGRADED_PROVIDER_BLOCK}"
+        )
+        agent = _make_agent(
+            prompt_source="provider_with_legacy_fallback",
+            external_block=prefixed_block,
+        )
+        parts = agent._build_system_prompt_parts()
+        volatile = parts["volatile"]
+
+        assert "## MEMORY" not in volatile
+        assert "legacy memory entry" not in volatile
+        assert "## USER PROFILE" not in volatile
+        assert "legacy user entry" not in volatile
+        assert "# ChromaDB Vector Memory" in volatile
+        assert "## Team Knowledge" in volatile
+        assert 'degraded="false"' in volatile
+
+    def test_unrelated_preface_without_complete_generated_profile_keeps_legacy(self):
+        """A mention/opening tag in arbitrary provider prose is not enough."""
+        agent = _make_agent(
+            prompt_source="provider_with_legacy_fallback",
+            external_block=(
+                "# ChromaDB Vector Memory\n"
+                "Active. Semantic search across 7 collections.\n"
+                "Debug note: <memory-profile source=\"chromadb\" degraded=\"false\">"
+            ),
+        )
+        parts = agent._build_system_prompt_parts()
+        volatile = parts["volatile"]
+
+        assert "## MEMORY" in volatile
+        assert "## USER PROFILE" in volatile
+        assert "Debug note: <memory-profile" in volatile
+
     def test_prompt_source_provider_with_legacy_fallback_keeps_builtin_when_provider_empty(self):
         agent = _make_agent(
             prompt_source="provider_with_legacy_fallback",
