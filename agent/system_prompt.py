@@ -65,6 +65,20 @@ def _external_memory_prompt_block(agent: Any) -> str:
     if manager is None:
         return ""
 
+    # Prefer the same-build pair hook. When this legacy helper is called
+    # directly (outside ``build_system_prompt_parts``), cache the rendered
+    # provider prompt for the next ``build_system_prompt()`` call so policy and
+    # render still use one generated-profile result.
+    paired_block = getattr(manager, "build_system_prompt_with_memory_profile", None)
+    if callable(paired_block):
+        try:
+            pair = paired_block(cache_for_render=True)
+            if isinstance(pair, tuple) and len(pair) == 2 and isinstance(pair[1], str):
+                return pair[1]
+        except Exception as exc:
+            logger.warning("External memory provider paired prompt block failed: %s", exc)
+            return ""
+
     # Prefer the narrow replacement-policy hook. Some providers render status
     # and untrusted recalled/team context alongside their generated profile in
     # ``system_prompt_block()``; replacement decisions must not parse that
@@ -145,14 +159,15 @@ def _is_non_degraded_memory_profile(block: str) -> bool:
     return bool(_DEGRADED_FALSE_RE.search(opening_tag))
 
 
-def _memory_prompt_policy(agent: Any) -> tuple[bool, str]:
+def _memory_prompt_policy(agent: Any, external_block: Optional[str] = None) -> tuple[bool, str]:
     """Return ``(suppress_legacy_flat_files, marker_to_insert)``.
 
     This policy is intentionally provider-agnostic: core only sees opaque
     provider text and the generated-profile wrapper contract.
     """
     prompt_source = (getattr(agent, "_memory_prompt_source", "legacy") or "legacy").strip()
-    external_block = _external_memory_prompt_block(agent)
+    if external_block is None:
+        external_block = _external_memory_prompt_block(agent)
     external_non_degraded = _is_non_degraded_memory_profile(external_block)
 
     if prompt_source == "provider":
@@ -438,7 +453,26 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # ── Volatile tier (changes per session/turn — never cached) ───
     volatile_parts: List[str] = []
 
-    suppress_legacy_memory, memory_provider_marker = _memory_prompt_policy(agent)
+    _ext_mem_block = ""
+    _ext_profile_block = ""
+    if agent._memory_manager:
+        try:
+            _build_with_profile = getattr(
+                agent._memory_manager, "build_system_prompt_with_memory_profile", None)
+            if callable(_build_with_profile):
+                _pair = _build_with_profile()
+                if isinstance(_pair, tuple) and len(_pair) == 2:
+                    _ext_mem_block = _pair[0] if isinstance(_pair[0], str) else ""
+                    _ext_profile_block = _pair[1] if isinstance(_pair[1], str) else ""
+            else:
+                _ext_mem_block = agent._memory_manager.build_system_prompt()
+                _ext_profile_block = _external_memory_prompt_block(agent)
+        except Exception:
+            _ext_mem_block = ""
+            _ext_profile_block = ""
+
+    suppress_legacy_memory, memory_provider_marker = _memory_prompt_policy(
+        agent, external_block=_ext_profile_block)
 
     if memory_provider_marker:
         volatile_parts.append(memory_provider_marker)
@@ -457,13 +491,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # External memory provider system prompt block (additive unless provider
     # policy used it to replace legacy flat-file memory/profile blocks).
-    if agent._memory_manager:
-        try:
-            _ext_mem_block = agent._memory_manager.build_system_prompt()
-            if _ext_mem_block:
-                volatile_parts.append(_ext_mem_block)
-        except Exception:
-            pass
+    if _ext_mem_block:
+        volatile_parts.append(_ext_mem_block)
 
     from hermes_time import now as _hermes_now
     now = _hermes_now()

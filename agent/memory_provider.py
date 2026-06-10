@@ -103,6 +103,19 @@ class MemoryProvider(ABC):
         """
         return self.system_prompt_block()
 
+    def system_prompt_block_with_memory_profile(self) -> tuple[str, str]:
+        """Return rendered prompt text and the trusted profile block it contains.
+
+        Prompt-source replacement must use the same provider-owned generated
+        profile block that is actually rendered into the prompt.  Providers with
+        non-pure profile builders should override this to compute the generated
+        profile once and return ``(rendered_system_block, generated_profile)``.
+        """
+        block = self.system_prompt_block()
+        if type(self).memory_profile_prompt_block is MemoryProvider.memory_profile_prompt_block:
+            return block, block
+        return block, self.memory_profile_prompt_block()
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Recall relevant context for the upcoming turn.
 

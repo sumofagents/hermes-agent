@@ -651,6 +651,36 @@ def test_provider_memory_profile_prompt_block_excludes_team_context(monkeypatch,
     assert "## Team Knowledge" not in profile_block
 
 
+def test_provider_system_prompt_pair_uses_one_generated_profile(monkeypatch, tmp_path):
+    provider = _make_provider_with_fakes(
+        monkeypatch,
+        prompt_source="provider_with_legacy_fallback",
+        generated_enabled=True,
+        hermes_home=str(tmp_path),
+    )
+    generated = (
+        '<memory-profile source="chromadb" degraded="false">\n'
+        '- > "single build profile"\n'
+        '</memory-profile>'
+    )
+    calls = []
+
+    def fake_generated():
+        calls.append(1)
+        if len(calls) == 1:
+            return generated
+        return ""
+
+    monkeypatch.setattr(provider, "_build_generated_profile_block", fake_generated)
+
+    block, profile = provider.system_prompt_block_with_memory_profile()
+
+    assert calls == [1]
+    assert profile == generated
+    assert generated in block
+    assert "# ChromaDB Vector Memory" in block
+
+
 def test_provider_generates_block_in_shadow_mode_via_query(monkeypatch, tmp_path):
     provider = _make_provider_with_fakes(
         monkeypatch,

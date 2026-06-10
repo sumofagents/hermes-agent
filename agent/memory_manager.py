@@ -267,6 +267,7 @@ class MemoryManager:
         # _submit_background() and the sync_all/queue_prefetch_all rationale.
         self._sync_executor: Optional[ThreadPoolExecutor] = None
         self._sync_executor_lock = threading.Lock()
+        self._system_prompt_pair_cache: Optional[tuple[str, str]] = None
 
     # -- Registration --------------------------------------------------------
 
@@ -355,18 +356,52 @@ class MemoryManager:
         Returns combined text, or empty string if no providers contribute.
         Each non-empty block is labeled with the provider name.
         """
+        if self._system_prompt_pair_cache is not None:
+            block, _profile = self._system_prompt_pair_cache
+            self._system_prompt_pair_cache = None
+            return block
+        block, _profile = self._compute_system_prompt_with_memory_profile()
+        return block
+
+    def build_system_prompt_with_memory_profile(
+        self, *, cache_for_render: bool = False) -> tuple[str, str]:
+        """Collect rendered provider prompt plus trusted external profile block.
+
+        The returned profile block is the provider-owned generated profile that
+        is part of the rendered external provider prompt.  This prevents prompt
+        policy from suppressing legacy MEMORY/USER from one generated-profile
+        call while rendering a different/empty provider block from another.
+        """
+        pair = self._compute_system_prompt_with_memory_profile()
+        self._system_prompt_pair_cache = pair if cache_for_render else None
+        return pair
+
+    def _compute_system_prompt_with_memory_profile(self) -> tuple[str, str]:
         blocks = []
+        external_profile_block = ""
         for provider in self._providers:
             try:
-                block = provider.system_prompt_block()
+                block, profile_block = provider.system_prompt_block_with_memory_profile()
+                block = block if isinstance(block, str) else ""
+                profile_block = profile_block if isinstance(profile_block, str) else ""
                 if block and block.strip():
                     blocks.append(block)
+                if provider.name != "builtin" and not external_profile_block:
+                    # Only trust the narrow profile signal when it is actually
+                    # rendered in the provider block assembled for this prompt.
+                    if (
+                        block
+                        and profile_block
+                        and profile_block.strip()
+                        and profile_block.strip() in block
+                    ):
+                        external_profile_block = profile_block
             except Exception as e:
                 logger.warning(
-                    "Memory provider '%s' system_prompt_block() failed: %s",
+                    "Memory provider '%s' system_prompt_block_with_memory_profile() failed: %s",
                     provider.name, e,
                 )
-        return "\n\n".join(blocks)
+        return "\n\n".join(blocks), external_profile_block
 
     def external_system_prompt_block(self) -> str:
         """Return the system prompt block from the single external provider.

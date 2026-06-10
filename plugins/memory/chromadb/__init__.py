@@ -429,19 +429,8 @@ class ChromaDBMemoryProvider(MemoryProvider):
         """Return only provider-owned generated profile text for core policy."""
         return self._build_generated_profile_block()
 
-    def system_prompt_block(self) -> str:
-        """Return team knowledge context for the system prompt.
-
-        Phase 1 (Lane B): may additionally append a bounded
-        ``<memory-profile>`` block generated from vector memory when
-        ``prompt_source`` selects ``provider_with_legacy_fallback`` or
-        ``provider``.  In ``shadow`` mode the block is generated and cached
-        but NOT included in the returned text — operators get the
-        cache/debug artifact without changing the live prompt.
-
-        Team-knowledge injection is invariant across all prompt-source
-        modes (plan §"Generated Prompt Block Contract").
-        """
+    def _system_prompt_block_from_generated_profile(self, generated: str) -> str:
+        """Render provider prompt text using an already-built profile block."""
         if self._cron_skipped or not self._available:
             if not self._cron_skipped and not self._available:
                 self._append_boot_unavailable_receipt("chroma_unreachable")
@@ -465,11 +454,31 @@ class ChromaDBMemoryProvider(MemoryProvider):
             if team_context:
                 parts.append(f"\n## Team Knowledge\n{team_context}")
 
-        generated = self._build_generated_profile_block()
         if generated:
             parts.append(generated)
 
         return "\n".join(parts)
+
+    def system_prompt_block_with_memory_profile(self) -> tuple[str, str]:
+        """Return rendered provider prompt and the exact generated profile in it."""
+        generated = self._build_generated_profile_block()
+        return self._system_prompt_block_from_generated_profile(generated), generated
+
+    def system_prompt_block(self) -> str:
+        """Return team knowledge context for the system prompt.
+
+        Phase 1 (Lane B): may additionally append a bounded
+        ``<memory-profile>`` block generated from vector memory when
+        ``prompt_source`` selects ``provider_with_legacy_fallback`` or
+        ``provider``.  In ``shadow`` mode the block is generated and cached
+        but NOT included in the returned text — operators get the
+        cache/debug artifact without changing the live prompt.
+
+        Team-knowledge injection is invariant across all prompt-source
+        modes (plan §"Generated Prompt Block Contract").
+        """
+        generated = self._build_generated_profile_block()
+        return self._system_prompt_block_from_generated_profile(generated)
 
     # -- Generated profile (Phase 1 / Lane B) -------------------------------
 

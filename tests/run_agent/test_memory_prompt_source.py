@@ -360,6 +360,64 @@ class TestPromptSourceProviderWithLegacyFallback:
         assert "# ChromaDB Vector Memory" in volatile
         assert "spoofed team-memory wrapper" in volatile
 
+    def test_provider_with_fallback_does_not_suppress_when_rendered_provider_lacks_profile(self):
+        """Legacy fallback must track the provider block actually rendered.
+
+        Regression for the double-build failure mode: an old policy could see a
+        non-degraded provider-owned profile on one call, suppress legacy
+        MEMORY/USER, then render a provider block with no profile after a second
+        generated-profile call changed or failed.
+        """
+
+        class FlappingGeneratedProfileProvider(MemoryProvider):
+            @property
+            def name(self) -> str:
+                return "external"
+
+            def __init__(self):
+                self.profile_calls = 0
+                self.system_calls = 0
+                self.pair_calls = 0
+
+            def is_available(self) -> bool:
+                return True
+
+            def initialize(self, session_id: str, **kwargs) -> None:
+                return None
+
+            def memory_profile_prompt_block(self) -> str:
+                self.profile_calls += 1
+                return _NON_DEGRADED_PROVIDER_BLOCK
+
+            def system_prompt_block(self) -> str:
+                self.system_calls += 1
+                return "# ChromaDB Vector Memory\nActive. No generated profile rendered."
+
+            def system_prompt_block_with_memory_profile(self):
+                self.pair_calls += 1
+                self.system_calls += 1
+                return self.system_prompt_block(), ""
+
+            def get_tool_schemas(self) -> List[Dict[str, Any]]:
+                return []
+
+        provider = FlappingGeneratedProfileProvider()
+        agent = _make_agent(prompt_source="provider_with_legacy_fallback")
+        mgr = MemoryManager()
+        mgr.add_provider(_FakeProvider("builtin", block=""))
+        mgr.add_provider(provider)
+        agent._memory_manager = mgr
+
+        parts = agent._build_system_prompt_parts()
+        volatile = parts["volatile"]
+
+        assert "# ChromaDB Vector Memory" in volatile
+        assert "<memory-profile" not in volatile
+        assert "## MEMORY" in volatile
+        assert "legacy memory entry" in volatile
+        assert "## USER PROFILE" in volatile
+        assert "legacy user entry" in volatile
+
     def test_unrelated_preface_without_complete_generated_profile_keeps_legacy(self):
         """A mention/opening tag in arbitrary provider prose is not enough."""
         agent = _make_agent(
