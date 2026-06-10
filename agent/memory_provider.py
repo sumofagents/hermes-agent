@@ -90,6 +90,19 @@ class MemoryProvider(ABC):
         """
         return ""
 
+    def memory_profile_prompt_block(self) -> str:
+        """Return the trusted generated memory/profile block for replacement policy.
+
+        Core prompt-source policy uses this narrower hook to decide whether an
+        external provider can replace legacy MEMORY.md/USER.md blocks. Providers
+        that mix trusted generated profile output with untrusted/status/team
+        prose in ``system_prompt_block()`` should override this and return only
+        the provider-owned generated profile wrapper. The default preserves
+        compatibility for simple providers whose whole system prompt block is
+        their memory/profile block.
+        """
+        return self.system_prompt_block()
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Recall relevant context for the upcoming turn.
 

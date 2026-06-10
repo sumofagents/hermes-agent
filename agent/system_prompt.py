@@ -60,10 +60,24 @@ _DEGRADED_TRUE_RE = re.compile(r"\bdegraded\s*=\s*['\"]true['\"]", re.IGNORECASE
 
 
 def _external_memory_prompt_block(agent: Any) -> str:
-    """Return the external memory provider block used for prompt-source policy."""
+    """Return provider-owned memory/profile text used for prompt-source policy."""
     manager = getattr(agent, "_memory_manager", None)
     if manager is None:
         return ""
+
+    # Prefer the narrow replacement-policy hook. Some providers render status
+    # and untrusted recalled/team context alongside their generated profile in
+    # ``system_prompt_block()``; replacement decisions must not parse that
+    # whole opaque prompt as if every line were provider-owned profile output.
+    profile_block = getattr(manager, "external_memory_profile_block", None)
+    if callable(profile_block):
+        try:
+            block = profile_block()
+            return block if isinstance(block, str) else ""
+        except Exception as exc:
+            logger.warning("External memory provider profile block failed: %s", exc)
+            return ""
+
     external_block = getattr(manager, "external_system_prompt_block", None)
     if callable(external_block):
         try:

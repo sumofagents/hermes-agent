@@ -407,6 +407,28 @@ class ChromaDBMemoryProvider(MemoryProvider):
 
     # -- System prompt block ------------------------------------------------
 
+    def _sanitize_team_context_for_prompt(self, text: str) -> str:
+        """Render team context without allowing prompt wrapper spoofing."""
+        if not text:
+            return ""
+        try:
+            from plugins.memory.chromadb.prompt_profile import sanitize_fact
+        except Exception:
+            sanitize_fact = None  # type: ignore[assignment]
+
+        lines: List[str] = []
+        for line in str(text).splitlines():
+            if sanitize_fact is None:
+                cleaned = line
+            else:
+                cleaned, _demoted = sanitize_fact(line)
+            lines.append(cleaned)
+        return "\n".join(lines)
+
+    def memory_profile_prompt_block(self) -> str:
+        """Return only provider-owned generated profile text for core policy."""
+        return self._build_generated_profile_block()
+
     def system_prompt_block(self) -> str:
         """Return team knowledge context for the system prompt.
 
@@ -439,7 +461,9 @@ class ChromaDBMemoryProvider(MemoryProvider):
             )
 
         if self._team_context:
-            parts.append(f"\n## Team Knowledge\n{self._team_context}")
+            team_context = self._sanitize_team_context_for_prompt(self._team_context)
+            if team_context:
+                parts.append(f"\n## Team Knowledge\n{team_context}")
 
         generated = self._build_generated_profile_block()
         if generated:

@@ -393,6 +393,32 @@ class MemoryManager:
             return ""
         return ""
 
+    def external_memory_profile_block(self) -> str:
+        """Return the external provider's trusted memory/profile block.
+
+        This is intentionally narrower than ``external_system_prompt_block()``:
+        prompt-source replacement decisions should be based on provider-owned
+        generated profile output, not status prose or untrusted recalled/team
+        context that may also be rendered in the provider's system prompt.
+        Providers that do not override ``memory_profile_prompt_block()`` keep
+        the historical behavior via the base-class default.
+        """
+        for provider in self._providers:
+            if provider.name == "builtin":
+                continue
+            try:
+                block = provider.memory_profile_prompt_block()
+            except Exception as e:
+                logger.warning(
+                    "Memory provider '%s' memory_profile_prompt_block() failed: %s",
+                    provider.name, e,
+                )
+                return ""
+            if block and block.strip():
+                return block
+            return ""
+        return ""
+
     # -- Prefetch / recall ---------------------------------------------------
 
     def prefetch_all(self, query: str, *, session_id: str = "") -> str:
