@@ -1090,6 +1090,9 @@ def init_agent(
         _agent_cfg = _load_agent_config()
     except Exception:
         _agent_cfg = {}
+    if not isinstance(_agent_cfg, dict):
+        _agent_cfg = {}
+    agent._agent_config = _agent_cfg
     try:
         agent._tool_guardrails = ToolCallGuardrailController(
             ToolCallGuardrailConfig.from_mapping(

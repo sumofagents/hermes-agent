@@ -1657,7 +1657,8 @@ def run_conversation(
                                 wall_ms=int(api_duration * 1000),
                                 source=agent.platform or "cli",
                                 base_url=agent.base_url,
-                            )
+                            ),
+                            config=getattr(agent, "_agent_config", None),
                         )
                     except Exception as e:
                         logger.debug(

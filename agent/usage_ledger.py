@@ -248,16 +248,29 @@ def build_model_call_event(
     )
 
 
+def _usage_ledger_config_section(config: Optional[dict[str, Any]]) -> dict[str, Any]:
+    if not isinstance(config, dict):
+        return {}
+    section = config.get("usage_ledger") or config.get("oracle_usage_ledger") or {}
+    return section if isinstance(section, dict) else {}
+
+
+def _usage_ledger_path_from_config(config: Optional[dict[str, Any]]) -> Optional[Path]:
+    section = _usage_ledger_config_section(config)
+    configured = section.get("path") or section.get("file")
+    if not configured:
+        return None
+    return Path(os.path.expanduser(str(configured))).resolve()
+
+
 def usage_ledger_enabled(config: Optional[dict[str, Any]] = None) -> bool:
     env = os.getenv("HERMES_USAGE_LEDGER_ENABLED", "").strip().lower()
     if env in {"1", "true", "yes", "on"}:
         return True
     if env in {"0", "false", "no", "off"}:
         return False
-    if config:
-        section = config.get("usage_ledger") or config.get("oracle_usage_ledger") or {}
-        return bool(section.get("enabled", False))
-    return False
+    section = _usage_ledger_config_section(config)
+    return bool(section.get("enabled", False))
 
 
 def write_usage_span(
@@ -272,7 +285,9 @@ def write_usage_span(
     if not enabled:
         return UsageLedgerWriteResult(written=False, reason="disabled")
 
-    ledger_path = path or (get_hermes_home() / "usage_ledger" / "spans.jsonl")
+    ledger_path = path or _usage_ledger_path_from_config(config) or (
+        get_hermes_home() / "usage_ledger" / "spans.jsonl"
+    )
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
     with ledger_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event.to_json_dict(), sort_keys=True, separators=(",", ":")) + "\n")

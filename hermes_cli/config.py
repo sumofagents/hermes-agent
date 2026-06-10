@@ -1758,6 +1758,15 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # Metadata-only Oracle/Rilo usage ledger. Disabled by default; can be
+    # enabled in config.yaml without relying on process environment. The
+    # environment variable HERMES_USAGE_LEDGER_ENABLED remains an emergency
+    # override for operators and tests.
+    "usage_ledger": {
+        "enabled": False,
+        "path": "",  # empty = ~/.hermes/usage_ledger/spans.jsonl
+    },
+
     # Subagent delegation — override the provider:model used by delegate_task
     # so child agents can run on a different (cheaper/faster) provider and model.
     # Uses the same runtime provider resolution as CLI/gateway startup, so all
@@ -1771,6 +1780,9 @@ DEFAULT_CONFIG = {
                            # "codex_responses", or "anthropic_messages". Empty = auto-detect
                            # from URL (e.g. /anthropic suffix → anthropic_messages). Set this
                            # explicitly for non-standard endpoints the heuristic can't detect.
+        "claude_cli": {
+            "path": "",     # empty = auto-detect; env HERMES_CLAUDE_CLI_PATH remains an override
+        },
         # When delegate_task narrows child toolsets explicitly, preserve any
         # MCP toolsets the parent already has enabled. On by default so
         # narrowing (e.g. toolsets=["web","browser"]) expresses "I want these

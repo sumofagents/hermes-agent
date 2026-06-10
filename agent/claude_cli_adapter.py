@@ -26,8 +26,39 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def _configured_claude_cli_path() -> str:
+    """Return config-backed Claude CLI path, if configured."""
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+    except Exception:
+        return ""
+    if not isinstance(cfg, dict):
+        return ""
+
+    candidates = []
+    delegation = cfg.get("delegation") or {}
+    if isinstance(delegation, dict):
+        nested = delegation.get("claude_cli") or {}
+        if isinstance(nested, dict):
+            candidates.append(nested.get("path"))
+        candidates.append(delegation.get("claude_cli_path"))
+    top_level = cfg.get("claude_cli") or {}
+    if isinstance(top_level, dict):
+        candidates.append(top_level.get("path"))
+
+    for candidate in candidates:
+        if candidate:
+            return os.path.expanduser(str(candidate).strip())
+    return ""
+
+
 def _resolve_claude_cli_path() -> str:
     """Resolve the path to the claude CLI executable."""
+    config_path = _configured_claude_cli_path()
+    if config_path:
+        return config_path
     env_path = os.getenv("HERMES_CLAUDE_CLI_PATH", "").strip()
     if env_path:
         return env_path
@@ -242,8 +273,8 @@ def dispatch_claude_agent(
         raise RuntimeError("Claude CLI agent timed out after 20 minutes")
     except FileNotFoundError:
         raise RuntimeError(
-            "Claude CLI not found. Ensure 'claude' is installed and in PATH, "
-            "or set HERMES_CLAUDE_CLI_PATH to the full path."
+            "Claude CLI not found. Configure delegation.claude_cli.path in config.yaml, "
+            "install Claude Code in PATH, or set HERMES_CLAUDE_CLI_PATH to the full path."
         )
 
     if result.returncode != 0:

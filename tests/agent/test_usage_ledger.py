@@ -7,6 +7,7 @@ from agent.usage_ledger import (
     UsageLedgerEvent,
     build_model_call_event,
     classify_billing_route,
+    usage_ledger_enabled,
     write_usage_span,
 )
 
@@ -28,6 +29,35 @@ def test_usage_span_writer_is_disabled_by_default(tmp_path, monkeypatch):
     assert result.written is False
     assert result.reason == "disabled"
     assert not (tmp_path / "usage_ledger" / "spans.jsonl").exists()
+
+
+def test_usage_ledger_has_config_default_and_writer_honors_config_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("HERMES_USAGE_LEDGER_ENABLED", raising=False)
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["usage_ledger"]["enabled"] is False
+    assert usage_ledger_enabled(DEFAULT_CONFIG) is False
+
+    ledger_path = tmp_path / "configured" / "spans.jsonl"
+    event = UsageLedgerEvent(
+        event_id="evt_config",
+        trace_id="trace_config",
+        event_type="model_call",
+        status_class="success",
+        provider="openai-codex",
+        model="gpt-5.5",
+    )
+
+    result = write_usage_span(
+        event,
+        config={"usage_ledger": {"enabled": True, "path": str(ledger_path)}},
+    )
+
+    assert result.written is True
+    assert result.path == ledger_path.resolve()
+    assert ledger_path.exists()
+    assert not (tmp_path / "home" / "usage_ledger" / "spans.jsonl").exists()
 
 
 def test_usage_span_writer_drops_sensitive_and_research_evidence_fields(tmp_path, monkeypatch):
