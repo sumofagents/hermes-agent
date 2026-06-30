@@ -9,6 +9,19 @@ neural rankers, learned weights, or additional model calls. It applies
 information geometry — the Fisher-Rao metric on a categorical probability
 simplex — to rerank candidates returned by a vector database.
 
+**Embedding-agnostic.** The module operates on plain Python dicts
+(`{"id": ..., "content": ..., "metadata": ...}`) returned by any vector
+database — ChromaDB, Pinecone, FAISS, or any custom provider. It does not
+call embedding services, does not depend on any specific embedding model, and
+does not make network calls. It is pure post-processing on candidate rows that
+the vector DB has already retrieved.
+
+This separation matters: the reranker cares about the **typed semantic
+structure** of each memory (subjects, predicates, claim types, dates, facets),
+not about the embedding space. Two memories with similar embeddings but
+different semantic types ("prefers concise" vs "prefers detailed") are correctly
+separated because their typed atoms differ, not because their vectors differ.
+
 This implements the consumer-relative validity criterion and Fisher-Rao
 retrieval geometry from:
 
@@ -85,17 +98,36 @@ where `w` is the `score_weight` parameter (default: 0.35).
 
 ## Configuration
 
-```yaml
-# config.yaml
-memory:
-  provider: chromadb
-  fi_reranker:
-    enabled: true
-    score_weight: 0.35        # blend weight (0=original, 1=pure FI)
-    candidate_multiplier: 4   # over-fetch factor
-    max_candidates: 80        # hard cap on candidates to rerank
-    min_candidates: 3         # skip reranking below this count
-    annotate_results: true    # add fi_score/fi_distance/fi_penalty to results
+The reranker is controlled by config keys in whatever config your provider
+reads (e.g. `chromadb.json`, `config.yaml`, or inline dict). It does not
+need its own config file — it reads from the provider's config section.
+
+Provider-agnostic config shape:
+
+```python
+# Any provider can pass these to rerank_rows():
+rerank_rows(
+    query,
+    candidates,
+    score_weight=0.35,      # blend weight (0=original order, 1=pure FI)
+    max_candidates=80,       # cap on candidates to rerank
+    annotate=True,           # add fi_score/fi_distance/fi_penalty to results
+)
+```
+
+For ChromaDB-provider-specific config (in `chromadb.json`):
+
+```json
+{
+  "fi_reranker": {
+    "enabled": true,
+    "score_weight": 0.35,
+    "candidate_multiplier": 4,
+    "max_candidates": 80,
+    "min_candidates": 3,
+    "annotate_results": true
+  }
+}
 ```
 
 When disabled, the provider falls through to standard composite scoring

@@ -1,13 +1,14 @@
 """Tests for the Fisher-Rao pullback memory reranker.
 
-These tests do NOT require ChromaDB or any external service. They construct
-candidate rows as plain dicts and test the reranker directly.
+These tests do NOT require ChromaDB, an embedding service, or any external
+service. They construct candidate rows as plain dicts and test the reranker
+directly.
 """
 
 import math
 import pytest
 
-from plugins.memory.chromadb.fi_reranker import (
+from plugins.memory.fi_reranker import (
     fisher_rao_distance,
     normalize,
     rerank_rows,
@@ -82,28 +83,28 @@ class TestParaphraseRecall:
                 "metadata": {"status": "active", "kind": "preference"},
             },
             {
-                "id": "infra_sentinel",
-                "content": "Sentinel server runs ChromaDB on port 8000 with Forge embeddings on port 8006.",
+                "id": "infra_db",
+                "content": "The vector database runs on port 5432 with the embedding service on port 8080.",
                 "metadata": {"status": "active", "kind": "infrastructure"},
             },
             {
-                "id": "constraint_boa",
-                "content": "Bank of America no-outside-business policy blocks operating a company until he quits.",
+                "id": "constraint_policy",
+                "content": "Company policy prohibits external business activities while employed.",
                 "metadata": {"status": "active", "kind": "constraint"},
             },
             {
                 "id": "correction_naming",
-                "content": "Use financial-crimes modeling not cyber investigator for outward framing.",
+                "content": "Use backend engineering not frontend developer for the role description.",
                 "metadata": {"status": "active", "kind": "correction"},
             },
             {
-                "id": "event_spacex",
-                "content": "SpaceX outreach email ai_eng@spacex.com verified on 2026-06-29.",
+                "id": "event_meeting",
+                "content": "Team sync scheduled for 2026-03-15 to review the deployment pipeline.",
                 "metadata": {"status": "active", "kind": "event"},
             },
             {
                 "id": "identity_role",
-                "content": "Targets senior principal AI engineering roles at SpaceX Anduril and Nous Research.",
+                "content": "The developer targets senior platform engineering roles at growing startups.",
                 "metadata": {"status": "active", "kind": "identity"},
             },
         ]
@@ -112,46 +113,46 @@ class TestParaphraseRecall:
     def paraphrase_queries(self):
         return {
             "pref_concise": [
-                "what communication style does he like",
-                "does he prefer short or long answers",
-                "how should I format responses",
-                "does he want brief responses",
-                "what is his preferred interaction style",
+                "what communication style does the user like",
+                "does the user prefer short or long answers",
+                "how should responses be formatted",
+                "does the user want brief responses",
+                "what is the preferred interaction style",
             ],
-            "infra_sentinel": [
+            "infra_db": [
                 "what port is the vector database on",
                 "where does the embedding service run",
-                "what server hosts ChromaDB",
-                "how is the memory infrastructure configured",
-                "where are the Qwen embeddings served",
+                "what ports are used for infrastructure",
+                "how is the database configured",
+                "what service runs on port 8080",
             ],
-            "constraint_boa": [
-                "can he start a company while employed",
-                "what is the Bank of America restriction",
-                "is he allowed to operate a business",
-                "what blocks him from doing outside business",
-                "when can he start a company",
+            "constraint_policy": [
+                "can the employee start a side business",
+                "what is the company policy restriction",
+                "is external work allowed while employed",
+                "what activities are prohibited",
+                "what does the policy block",
             ],
             "correction_naming": [
-                "what should I call his fraud work",
-                "is it cyber investigator or something else",
-                "how should I describe his professional focus",
-                "what is the correct framing for his work",
-                "what not to call his background",
+                "what should the role be called",
+                "is it frontend developer or something else",
+                "how should the position be described",
+                "what is the correct title for the role",
+                "what not to call the position",
             ],
-            "event_spacex": [
-                "when was the SpaceX email verified",
-                "what is the SpaceX contact email",
-                "did he reach out to SpaceX",
-                "what happened in late June 2026",
-                "what is the ai_eng address",
+            "event_meeting": [
+                "when is the team sync scheduled",
+                "what meeting is planned for March",
+                "was there a deployment review scheduled",
+                "what happened on 2026-03-15",
+                "what is the team meeting about",
             ],
             "identity_role": [
-                "what companies is he targeting",
-                "what level of role does he want",
-                "is he looking for senior positions",
-                "what kind of jobs is he applying for",
-                "where does he want to work in AI",
+                "what roles is the developer targeting",
+                "what level of position is being sought",
+                "is the developer looking for senior roles",
+                "what kind of jobs are being pursued",
+                "what companies are being targeted",
             ],
         }
 
@@ -190,27 +191,27 @@ class TestNearNegativeDiscrimination:
                 "metadata": {"status": "active"},
             },
         ]
-        reranked = rerank_rows("does he prefer brief concise responses", rows, score_weight=1.0)
+        reranked = rerank_rows("does the user prefer brief concise responses", rows, score_weight=1.0)
         assert reranked[0]["id"] == "pref_concise"
 
     def test_distinguishes_infra_ports(self):
         rows = [
             {
-                "id": "chroma_port",
-                "content": "ChromaDB vector database runs on port 8000 on the Sentinel server.",
+                "id": "db_port",
+                "content": "The vector database service runs on port 5432 on the primary server.",
                 "metadata": {"status": "active"},
             },
             {
-                "id": "embed_port",
-                "content": "Qwen embedding service runs on port 8006 on the Forge server.",
+                "id": "cache_port",
+                "content": "The Redis cache service runs on port 6379 on the secondary server.",
                 "metadata": {"status": "active"},
             },
         ]
         reranked = rerank_rows("what port is the vector database on", rows, score_weight=1.0)
-        assert reranked[0]["id"] == "chroma_port"
+        assert reranked[0]["id"] == "db_port"
 
-        reranked2 = rerank_rows("what port is the embedding service on", rows, score_weight=1.0)
-        assert reranked2[0]["id"] == "embed_port"
+        reranked2 = rerank_rows("what port is the Redis cache on", rows, score_weight=1.0)
+        assert reranked2[0]["id"] == "cache_port"
 
 
 # ---------------------------------------------------------------------------
@@ -224,17 +225,17 @@ class TestSupersessionOrdering:
         rows = [
             {
                 "id": "old_rule",
-                "content": "Memory receipt max age is seven days and stale receipts may promote claims.",
+                "content": "Memory cache max age is seven days and stale entries may still be served.",
                 "metadata": {"status": "superseded"},
             },
             {
                 "id": "new_rule",
-                "content": "Memory receipt must be checked within max-age window and stale receipts cannot promote claims.",
+                "content": "Memory cache must be checked within max-age window and stale entries cannot be served.",
                 "metadata": {"status": "active"},
             },
         ]
         reranked = rerank_rows(
-            "current active rule about memory receipt max age stale",
+            "current active rule about memory cache max age stale entries",
             rows,
             score_weight=1.0,
             annotate=True,
@@ -292,7 +293,7 @@ class TestDecoyQuarantine:
                 "metadata": {"status": "active"},
             },
         ]
-        reranked = rerank_rows("does he prefer concise answers", rows, score_weight=1.0)
+        reranked = rerank_rows("does the user prefer concise answers", rows, score_weight=1.0)
         assert reranked[0]["id"] == "real_pref"
 
 
@@ -329,15 +330,14 @@ class TestClaimEventFrame:
         assert "preference" in frame["claim_types"]
 
     def test_extracts_dates(self):
-        frame = extract_claim_event_frame("SpaceX outreach verified on 2026-06-29.", is_query=True)
+        frame = extract_claim_event_frame("Team meeting scheduled for 2026-03-15.", is_query=True)
         assert "event_time" in frame["claim_types"]
-        assert "2026-06-29" in frame["time_expressions"]
+        assert "2026-03-15" in frame["time_expressions"]
 
     def test_extracts_infrastructure(self):
-        frame = extract_claim_event_frame("ChromaDB runs on port 8000.", is_query=True)
-        # Should have some work/infrastructure related atoms
+        frame = extract_claim_event_frame("Database runs on port 5432.", is_query=True)
         assert len(frame["keywords"]) > 0
 
     def test_extracts_identity(self):
-        frame = extract_claim_event_frame("His role is senior AI engineer.", is_query=True)
+        frame = extract_claim_event_frame("The role is senior platform engineer.", is_query=True)
         assert "identity" in frame["claim_types"]
