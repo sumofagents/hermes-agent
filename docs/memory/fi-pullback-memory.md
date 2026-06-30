@@ -17,15 +17,6 @@ retrieval geometry from:
 >
 > _Citation will be updated with DOI/arXiv link upon publication._
 
-### Honest fidelity statement
-
-The paper's validity criterion is a principled predicate (consumer-equivalence
-test). This implementation approximates it with hand-tuned additive scalar
-penalties over typed-atom overlap — there is no literal `q(x)=q(y)` equivalence
-test. It is an engineering surrogate that captures the structure of the
-criterion (near + valid-for-this-consumer) without claiming to be a formal
-realization.
-
 The Fisher-Rao distance uses `arccos(BC)` (range `[0, π/2]`); the canonical
 Fisher-Rao geodesic is `2·arccos(BC)` (range `[0, π]`). The factor-of-2
 difference is irrelevant for ranking since arccos is monotone.
