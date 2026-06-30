@@ -1,10 +1,10 @@
-1|# Fisher-Rao Pullback Memory Reranker
+# Manifold Destiny Memory Reranker
 2|
 3|Parameter-free Fisher-Rao reranking for agent memory retrieval.
 4|
 5|## Overview
 6|
-7|The Fisher-Rao pullback reranker improves memory retrieval quality without
+7|The Manifold Destiny reranker improves memory retrieval quality without
 8|neural rankers, learned weights, or additional model calls. It applies
 9|information geometry — the Fisher-Rao metric on a categorical probability
 10|simplex — to rerank candidates returned by a vector database.
@@ -29,6 +29,7 @@
 29|> of Truth-Verified Structure from the Zero-Information Floor" (2026).
 30|>
 31|> _Citation will be updated with DOI/arXiv link upon publication._
+> _Code, test artifacts, and quantum data: https://github.com/manifold-destiny/manifold-destiny (public upon paper release)._
 32|
 33|The Fisher-Rao distance uses `arccos(BC)` (range `[0, π/2]`); the canonical
 34|Fisher-Rao geodesic is `2·arccos(BC)` (range `[0, π]`). The factor-of-2

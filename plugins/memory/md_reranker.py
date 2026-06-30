@@ -1,10 +1,11 @@
-"""Fisher-Rao pullback reranker for agent memory retrieval.
+"""Manifold Destiny reranker for agent memory retrieval.
 
 Implements the consumer-relative validity criterion and Fisher-Rao retrieval
 geometry from:
 
     Thompson & Horowitz, "Manifold Destiny: Continuous Learning by Consumption
     of Truth-Verified Structure from the Zero-Information Floor" (2026).
+    Code: https://github.com/manifold-destiny/manifold-destiny (public upon release).
 
 Core idea: memory retrieval should rank by information-geometric distance on a
 categorical probability simplex, not just vector cosine similarity. Each memory
