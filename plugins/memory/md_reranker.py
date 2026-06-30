@@ -680,7 +680,7 @@ def validity_penalty(
 # ---------------------------------------------------------------------------
 
 @dataclass
-class ManifoldRank:
+class MDRank:
     """Reranking result for a single candidate row."""
     index: int
     row: dict[str, Any]
@@ -723,8 +723,8 @@ def rerank_rows(
             ``text``), ``metadata``, ``id``, ``composite_score``.
         score_weight: Blend weight for FI rank vs original rank (0.0–1.0).
         max_candidates: Maximum number of top candidates to rerank.
-        annotate: If True, annotate each row with ``manifold_score``,
-            ``manifold_distance``, ``manifold_penalty`` fields.
+        annotate: If True, annotate each row with ``md_score``,
+            ``md_distance``, ``md_penalty`` fields.
 
     Returns:
         Reranked list of rows (same dicts, possibly annotated).
@@ -756,14 +756,14 @@ def rerank_rows(
     q_prob = normalize(q_atoms)
 
     # Compute Fisher-Rao distance + validity penalty for each candidate
-    ranks: list[ManifoldRank] = []
+    ranks: list[MDRank] = []
     for idx, row, atoms_raw in raw_docs:
         atoms = _idf_scale(atoms_raw, idf, default_idf)
         dist = fisher_rao_distance(q_prob, normalize(atoms))
         meta = dict(row.get("metadata") or {})
         penalty = validity_penalty(q_atoms, atoms, meta)
-        manifold_score = -(dist + penalty)
-        ranks.append(ManifoldRank(idx, row, dist, penalty, manifold_score, len(atoms)))
+        md_score = -(dist + penalty)
+        ranks.append(MDRank(idx, row, dist, penalty, md_score, len(atoms)))
 
     # FI-only ordering
     fi_order = {
@@ -776,7 +776,7 @@ def rerank_rows(
     # Blend FI rank with original Chroma rank
     denom = max(1, len(ranks) - 1)
     w = min(1.0, max(0.0, float(score_weight)))
-    weighted: list[tuple[float, float, str, ManifoldRank]] = []
+    weighted: list[tuple[float, float, str, MDRank]] = []
     for rank in ranks:
         base_rank_score = 1.0 - (rank.index / denom)
         fi_rank_score = 1.0 - (fi_order[rank.index] / denom)
@@ -785,18 +785,18 @@ def rerank_rows(
 
     # Build output
     out: list[dict[str, Any]] = []
-    for combined, _manifold_score, _doc_id, rank in sorted(
+    for combined, _md_score, _doc_id, rank in sorted(
         weighted, key=lambda item: (-item[0], -item[1], item[2])
     ):
         row = dict(rank.row)
         if annotate:
-            row["manifold_score"] = rank.score
-            row["manifold_distance"] = rank.distance
-            row["manifold_penalty"] = rank.penalty
-            row["manifold_combined_score"] = combined
-            row["manifold_atom_count"] = rank.atom_count
+            row["md_score"] = rank.score
+            row["md_distance"] = rank.distance
+            row["md_penalty"] = rank.penalty
+            row["md_combined_score"] = combined
+            row["md_atom_count"] = rank.atom_count
             if "composite_score" in row:
-                row["pre_manifold_composite_score"] = row.get("composite_score")
+                row["pre_md_composite_score"] = row.get("composite_score")
             row["composite_score"] = combined
         out.append(row)
     out.extend(tail)

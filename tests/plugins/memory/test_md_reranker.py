@@ -8,7 +8,7 @@ directly.
 import math
 import pytest
 
-from plugins.memory.manifold_reranker import (
+from plugins.memory.md_reranker import (
     fisher_rao_distance,
     normalize,
     rerank_rows,
@@ -307,17 +307,17 @@ class TestAnnotation:
             {"id": "m1", "content": "Test memory about Python development.", "metadata": {"status": "active"}},
         ]
         result = rerank_rows("Python development", rows, annotate=True)
-        assert "manifold_score" in result[0]
-        assert "manifold_distance" in result[0]
-        assert "manifold_penalty" in result[0]
-        assert "manifold_combined_score" in result[0]
+        assert "md_score" in result[0]
+        assert "md_distance" in result[0]
+        assert "md_penalty" in result[0]
+        assert "md_combined_score" in result[0]
 
     def test_no_annotate_clean(self):
         rows = [
             {"id": "m1", "content": "Test memory about Python development.", "metadata": {"status": "active"}},
         ]
         result = rerank_rows("Python development", rows, annotate=False)
-        assert "manifold_score" not in result[0]
+        assert "md_score" not in result[0]
 
 
 # ---------------------------------------------------------------------------
@@ -392,9 +392,9 @@ class TestPostQueryRerankHook:
         result = provider.post_query_rerank("query", rows)
         assert result is rows  # same list, unchanged
 
-    def test_manifold_reranker_satisfies_hook(self):
+    def test_md_reranker_satisfies_hook(self):
         """The reference implementation can be used via the hook."""
-        from plugins.memory.manifold_reranker import rerank_rows
+        from plugins.memory.md_reranker import rerank_rows
 
         rows = [
             {"id": "m1", "content": "User prefers concise answers.", "metadata": {"status": "active"}},

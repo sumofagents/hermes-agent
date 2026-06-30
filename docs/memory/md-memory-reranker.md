@@ -111,7 +111,7 @@
 111|    candidates,
 112|    score_weight=0.35,      # blend weight (0=original order, 1=pure FI)
 113|    max_candidates=80,       # cap on candidates to rerank
-114|    annotate=True,           # add manifold_score/manifold_distance/manifold_penalty to results
+114|    annotate=True,           # add md_score/md_distance/md_penalty to results
 115|)
 116|```
 117|
@@ -119,7 +119,7 @@
 119|
 120|```json
 121|{
-122|  "manifold_reranker": {
+122|  "md_reranker": {
 123|    "enabled": true,
 124|    "score_weight": 0.35,
 125|    "candidate_multiplier": 4,
@@ -184,7 +184,7 @@
 184|used to pre-compute typed metadata:
 185|
 186|```python
-187|from plugins.memory.chromadb.manifold_reranker import extract_claim_event_frame
+187|from plugins.memory.chromadb.md_reranker import extract_claim_event_frame
 188|
 189|frame = extract_claim_event_frame("User prefers concise responses.")
 190|metadata = {
@@ -201,7 +201,7 @@
 201|
 202|## Backward Compatibility
 203|
-204|- **Disabled by default** (`manifold_reranker.enabled: false`)
+204|- **Disabled by default** (`md_reranker.enabled: false`)
 205|- When disabled, falls through to existing composite scoring
 206|- No changes to embedding dimensions or collection schema
 207|- No changes to memory tool API
