@@ -327,7 +327,7 @@ class MemoryProvider(ABC):
 
         A reference implementation using Fisher-Rao geometry on a
         categorical probability simplex is available at
-        ``plugins/memory/fi_reranker.py``. It is pure stdlib, embedding-
+        ``plugins/memory/manifold_reranker.py``. It is pure stdlib, embedding-
         agnostic, and requires no model calls or training data. See
         Thompson & Horowitz, "Manifold Destiny" (2026) for the theory.
 
