@@ -341,3 +341,66 @@ class TestClaimEventFrame:
     def test_extracts_identity(self):
         frame = extract_claim_event_frame("The role is senior platform engineer.", is_query=True)
         assert "identity" in frame["claim_types"]
+
+
+# ---------------------------------------------------------------------------
+# MemoryProvider ABC hook
+# ---------------------------------------------------------------------------
+
+class TestPostQueryRerankHook:
+    """Verify the optional hook on the MemoryProvider ABC."""
+
+    def test_default_is_noop(self):
+        """The default implementation returns rows unchanged."""
+        from agent.memory_provider import MemoryProvider
+
+        # Create a minimal concrete subclass
+        class StubProvider(MemoryProvider):
+            @property
+            def name(self) -> str:
+                return "stub"
+
+            def is_available(self) -> bool:
+                return False
+
+            def initialize(self, session_id: str, **kwargs) -> None:
+                pass
+
+            def system_prompt_block(self) -> str:
+                return ""
+
+            def prefetch(self, query: str, *, session_id: str = "") -> str:
+                return ""
+
+            def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+                pass
+
+            def get_tool_schemas(self) -> list:
+                return []
+
+            def handle_tool_call(self, name: str, args: dict) -> dict:
+                return {}
+
+            def shutdown(self) -> None:
+                pass
+
+        provider = StubProvider()
+        rows = [
+            {"id": "m1", "content": "test", "metadata": {}},
+            {"id": "m2", "content": "other", "metadata": {}},
+        ]
+        result = provider.post_query_rerank("query", rows)
+        assert result is rows  # same list, unchanged
+
+    def test_fi_reranker_satisfies_hook(self):
+        """The reference implementation can be used via the hook."""
+        from plugins.memory.fi_reranker import rerank_rows
+
+        rows = [
+            {"id": "m1", "content": "User prefers concise answers.", "metadata": {"status": "active"}},
+            {"id": "m2", "content": "Database runs on port 5432.", "metadata": {"status": "active"}},
+        ]
+        # A provider would call rerank_rows inside its post_query_rerank override
+        reranked = rerank_rows("communication style preferences", rows)
+        assert len(reranked) == 2
+        assert reranked[0]["id"] == "m1"  # concise answers matches better
