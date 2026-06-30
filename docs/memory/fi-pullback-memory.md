@@ -14,6 +14,21 @@ retrieval geometry from:
 
 > Thompson & Horowitz, "Manifold Destiny: Continuous Learning by Consumption
 > of Truth-Verified Structure from the Zero-Information Floor" (2026).
+>
+> _Citation will be updated with DOI/arXiv link upon publication._
+
+### Honest fidelity statement
+
+The paper's validity criterion is a principled predicate (consumer-equivalence
+test). This implementation approximates it with hand-tuned additive scalar
+penalties over typed-atom overlap — there is no literal `q(x)=q(y)` equivalence
+test. It is an engineering surrogate that captures the structure of the
+criterion (near + valid-for-this-consumer) without claiming to be a formal
+realization.
+
+The Fisher-Rao distance uses `arccos(BC)` (range `[0, π/2]`); the canonical
+Fisher-Rao geodesic is `2·arccos(BC)` (range `[0, π]`). The factor-of-2
+difference is irrelevant for ranking since arccos is monotone.
 
 ## How It Works
 
@@ -168,3 +183,41 @@ consistent (same normalization at write and read time).
 - No changes to embedding dimensions or collection schema
 - No changes to memory tool API
 - No external dependencies beyond the Python standard library
+
+## Next Research Directions
+
+These follow naturally from the paper's framework and the implementation's
+current limitations:
+
+### 1. Self-extending chart atoms (paper: self-extending theorem)
+
+Retained quotients promote to new grammar atoms (Section 4 of the paper).
+Currently, chart atoms are fixed. A natural extension: when a memory is
+repeatedly recalled and confirmed useful, its distinctive atoms promote to
+first-class chart coordinates — letting the reranker learn domain-specific
+vocabulary.
+
+### 2. Explicit consumer-scope injection (paper: consumer c as specification)
+
+Currently, consumer scope is inferred from query text. The paper treats the
+consumer as an explicit specification. A provider could pass structured task
+context as an explicit consumer-scope parameter, making the validity criterion
+sharper than keyword inference.
+
+### 3. Calibrated validity penalties (paper: calibrated retention)
+
+Validity penalty magnitudes are hand-set. These could be calibrated from user
+feedback — turning the declarative penalties into a calibrated retention layer
+without making them learned weights.
+
+### 4. Write-path verification gate (paper: verifier V as trust boundary)
+
+The paper's verifier is the trust boundary — only verified structure is
+retained. A stronger write gate could use the chart atoms themselves: require
+minimum atom count or claim-type coverage before accepting a memory.
+
+### 5. Cross-collection fiber merging (paper: same-fiber alias merge)
+
+The paper's manifold store merges distinct surface expressions with the same
+verified fiber. Same-fiber merging across collections would reduce redundancy
+and improve recall consistency.
