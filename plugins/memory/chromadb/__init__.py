@@ -1,0 +1,1990 @@
+"""ChromaDB memory plugin — MemoryProvider for ChromaDB-backed vector memory.
+
+Provides semantic search, composite scoring (similarity + recency + importance),
+team memory (store_discovery / search_knowledge), multi-agent collection
+segregation, memory consolidation, and session history.
+
+The 7 collections:
+  - agent_memories: core agent memories (mirrors flat-file writes)
+  - session_history: session summaries
+  - team_knowledge: shared infra, conventions, architecture
+  - team_ops: cross-agent coordination state
+  - agent_rilo, agent_caddie, agent_scout: per-agent private memory
+
+Config: $HERMES_HOME/chromadb.json (profile-scoped)
+
+Ported from:
+  - tools/vector_memory.py (VectorMemoryProvider, ForgeEmbeddingFunction)
+  - tools/vector_memory_config.py (VectorMemoryConfig)
+  - tools/vector_write_tool.py (team_memory tool)
+  - tools/memory_consolidation.py (MemoryConsolidator)
+"""
+
+from __future__ import annotations
+
+import concurrent.futures
+import hashlib
+import json
+import logging
+import threading
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from agent.memory_provider import MemoryProvider
+
+logger = logging.getLogger(__name__)
+
+
+_no_embedding_function_failure_count = 0
+
+
+def get_no_embedding_function_failure_count() -> int:
+    """Return how many times _embed() has been refused due to no EF available.
+
+    Monotonically increasing for the lifetime of the process. Reset by
+    restart only. Use for monitoring/alerting: a non-zero (and especially
+    growing) count means memory writes/reads are being silently dropped
+    because the embedding backend is unreachable.
+    """
+    return _no_embedding_function_failure_count
+
+
+# ---------------------------------------------------------------------------
+# Tool schemas
+# ---------------------------------------------------------------------------
+
+TEAM_MEMORY_SCHEMA = {
+    "name": "team_memory",
+    "description": (
+        "Store discoveries or search shared knowledge in team memory. "
+        "Use store_discovery to save infrastructure findings, API quirks, "
+        "conventions, or lessons learned. Use search_knowledge to find "
+        "relevant past discoveries."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["store_discovery", "search_knowledge"],
+                "description": (
+                    "Action to perform. 'store_discovery' saves content to a "
+                    "collection. 'search_knowledge' searches for relevant entries."
+                ),
+            },
+            "content": {
+                "type": "string",
+                "description": (
+                    "The discovery text to store (required for store_discovery)."
+                ),
+            },
+            "collection": {
+                "type": "string",
+                "enum": ["team_knowledge", "team_ops", "own"],
+                "description": (
+                    "Target collection. 'team_knowledge' for shared infra/conventions, "
+                    "'team_ops' for cross-agent coordination, 'own' for agent-private "
+                    "memories. Defaults to 'team_knowledge'."
+                ),
+            },
+            "query": {
+                "type": "string",
+                "description": (
+                    "Search query text (required for search_knowledge)."
+                ),
+            },
+        },
+        "required": ["action"],
+    },
+}
+
+VECTOR_SEARCH_SCHEMA = {
+    "name": "vector_search",
+    "description": (
+        "Semantic search over ChromaDB vector memory. Searches agent memories, "
+        "session history, or team knowledge by meaning, not just keywords. "
+        "Returns scored results ranked by composite relevance."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "What to search for in vector memory.",
+            },
+            "collection": {
+                "type": "string",
+                "enum": ["memories", "sessions", "team_knowledge", "team_ops", "all"],
+                "description": (
+                    "Which collection to search. 'all' searches across accessible "
+                    "collections. Defaults to 'memories'."
+                ),
+            },
+            "n_results": {
+                "type": "integer",
+                "description": "Maximum number of results (default: 5, max: 20).",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# MemoryProvider implementation
+# ---------------------------------------------------------------------------
+
+class ChromaDBMemoryProvider(MemoryProvider):
+    """ChromaDB-backed vector memory with semantic search, composite scoring,
+    team memory, and memory consolidation."""
+
+    def __init__(self):
+        self._client = None
+        self._collections: Dict[str, Any] = {}
+        self._available = False
+        self._config = None
+        self._session_id = ""
+        self._ef = None  # ForgeEmbeddingFunction, set in initialize()
+        self._hermes_home = ""
+        self._agent_name = "rilo"
+        self._team_context = ""
+
+        # Scoring weights (G1A v1 salience formula; config fields are kept for
+        # backward-compatible chromadb.json parsing but no longer override the
+        # contract weights).
+        self._w_sim = 0.35
+        self._w_rec = 0.25
+        self._w_source = 0.20
+        self._w_imp = 0.15
+        self._w_durability = 0.05
+
+        # Threading
+        self._prefetch_result = ""
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_thread: Optional[threading.Thread] = None
+        self._sync_thread: Optional[threading.Thread] = None
+
+        # Consolidator (lazy init)
+        self._consolidator = None
+
+        # Cron guard
+        self._cron_skipped = False
+
+        # Phase 1 / Lane B: generated profile prompt transport. Core sets
+        # these via initialize(**kwargs); the plugin never reads
+        # hermes_cli.config directly.
+        self._prompt_source: str = "legacy"
+        self._generated_profile_enabled: bool = False
+        self._agent_context: str = "primary"
+        self._boot_synthesis_enabled: bool = True
+        self._platform: str = "cli"
+        self._gateway_session_key: Optional[str] = None
+        self._boot_receipt_guarded: set[str] = set()
+
+    @property
+    def name(self) -> str:
+        return "chromadb"
+
+    # -- Availability --------------------------------------------------------
+
+    def is_available(self) -> bool:
+        """Check if ChromaDB plugin is configured. No network calls."""
+        try:
+            import chromadb  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    # -- Config schema for 'hermes memory setup' ----------------------------
+
+    def get_config_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "key": "chromadb_host",
+                "description": "ChromaDB server host (IP or hostname)",
+                "default": "100.107.68.104",
+                "required": True,
+            },
+            {
+                "key": "chromadb_port",
+                "description": "ChromaDB server port",
+                "default": "8000",
+            },
+            {
+                "key": "embedding_service_url",
+                "description": "Forge embedding service URL",
+                "default": "http://100.113.1.2:8006",
+            },
+        ]
+
+    def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
+        """Write config to $HERMES_HOME/chromadb.json."""
+        from pathlib import Path
+        config_path = Path(hermes_home) / "chromadb.json"
+        existing = {}
+        if config_path.exists():
+            try:
+                existing = json.loads(config_path.read_text())
+            except Exception:
+                pass
+        existing.update(values)
+        config_path.write_text(json.dumps(existing, indent=2))
+
+    # -- Initialize ----------------------------------------------------------
+
+    def initialize(self, session_id: str, **kwargs) -> None:
+        """Initialize ChromaDB client, collections, and team context."""
+        try:
+            # Cron guard
+            agent_context = kwargs.get("agent_context", "")
+            platform = kwargs.get("platform", "cli")
+            if agent_context in ("cron", "flush") or platform == "cron":
+                logger.debug("ChromaDB skipped: cron/flush context")
+                self._cron_skipped = True
+                return
+
+            self._session_id = session_id
+            self._hermes_home = kwargs.get("hermes_home", "")
+            self._agent_name = kwargs.get("agent_identity", "rilo")
+            self._platform = str(platform or "cli")
+            self._gateway_session_key = kwargs.get("gateway_session_key")
+            # Phase 1 transport: core tells the plugin which prompt-source
+            # mode is active and whether generated profile is enabled, via
+            # initialize kwargs.  The plugin must not import core config.
+            self._agent_context = str(agent_context or "primary")
+            self._prompt_source = str(kwargs.get("prompt_source", "legacy") or "legacy")
+            self._generated_profile_enabled = bool(
+                kwargs.get("generated_prompt_enabled", False)
+            )
+            self._boot_synthesis_enabled = bool(
+                kwargs.get("boot_synthesis_enabled", True)
+            )
+
+            # Load config
+            from plugins.memory.chromadb.config import ChromaDBConfig
+            if self._hermes_home:
+                self._config = ChromaDBConfig.from_json_file(self._hermes_home)
+            else:
+                self._config = ChromaDBConfig()
+
+            self._config.agent_name = self._agent_name
+            self._w_sim = 0.35
+            self._w_rec = 0.25
+            self._w_source = 0.20
+            self._w_imp = 0.15
+            self._w_durability = 0.05
+
+            # Init ChromaDB client
+            self._init_client()
+
+            if not self._available:
+                logger.debug("ChromaDB not available after init — plugin inactive")
+                return
+
+            # Pre-load team knowledge for system prompt injection
+            self._load_team_context()
+
+        except Exception as e:
+            logger.warning("ChromaDB init failed: %s", e)
+            self._available = False
+
+    def _init_client(self) -> None:
+        """Initialize ChromaDB client and all 7 collections."""
+        try:
+            import chromadb
+
+            self._client = chromadb.HttpClient(
+                host=self._config.chromadb_host,
+                port=self._config.chromadb_port,
+            )
+
+            # Set up embedding function for manual embedding.
+            # ChromaDB v1.5+ persists the EF config and rejects a different one
+            # at open time, so we open collections WITHOUT an EF and embed
+            # documents ourselves via ForgeEmbeddingFunction before add/query.
+            from plugins.memory.chromadb.embedding import get_embedding_function
+            self._ef = get_embedding_function(
+                self._config.embedding_service_url,
+                self._config.embedding_model,
+                fallback_enabled=self._config.embedding_fallback_enabled,
+                fallback_url=self._config.embedding_fallback_url,
+            )
+
+            # Open all configured collections without specifying an EF
+            for key, col_name in self._config.collections.items():
+                self._collections[key] = self._client.get_or_create_collection(
+                    name=col_name
+                )
+
+            # Ensure the current agent's own collection exists even if it
+            # wasn't listed in the static config (e.g. profile != "rilo").
+            _own_key = f"agent_{self._agent_name}"
+            if _own_key not in self._collections:
+                self._collections[_own_key] = self._client.get_or_create_collection(
+                    name=_own_key
+                )
+                logger.info("Created dynamic collection '%s' for agent identity", _own_key)
+
+            self._available = True
+            logger.info(
+                "ChromaDB connected at %s:%s (%d collections)",
+                self._config.chromadb_host,
+                self._config.chromadb_port,
+                len(self._collections),
+            )
+        except Exception as e:
+            self._available = False
+            logger.warning(
+                "ChromaDB unavailable (%s). Vector memory will return empty results.", e
+            )
+
+    def _load_team_context(self) -> None:
+        """Pre-load team knowledge for system prompt injection."""
+        if not self._available:
+            return
+        try:
+            results = self.search_team_knowledge(
+                "infrastructure conventions architecture workflow", n_results=10
+            )
+            if results:
+                scored = self._score_results(results)
+                scored.sort(key=lambda x: x["composite_score"], reverse=True)
+                entries = []
+                total = 0
+                for item in scored[:8]:
+                    content = item["content"]
+                    if total + len(content) > 1500:
+                        break
+                    entries.append(f"- {content}")
+                    total += len(content)
+                if entries:
+                    self._team_context = "\n".join(entries)
+        except Exception as e:
+            logger.debug("Failed to load team context: %s", e)
+
+    # -- Atlas FI runtime reranking -----------------------------------------
+
+    def _atlas_fi_cfg(self):
+        if self._config is None:
+            return None
+        return getattr(self._config, "atlas_fi_runtime", None)
+
+    def _atlas_fi_enabled(self) -> bool:
+        cfg = self._atlas_fi_cfg()
+        return bool(cfg and getattr(cfg, "enabled", False))
+
+    def _atlas_fi_query_count(self, requested: int) -> int:
+        cfg = self._atlas_fi_cfg()
+        if not cfg or not getattr(cfg, "enabled", False):
+            return requested
+        try:
+            return min(
+                int(getattr(cfg, "max_candidates", 80)),
+                max(int(requested), int(requested) * int(getattr(cfg, "candidate_multiplier", 4))),
+            )
+        except Exception:
+            return requested
+
+    def _atlas_fi_rerank(self, query: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        cfg = self._atlas_fi_cfg()
+        if not cfg or not getattr(cfg, "enabled", False) or not query or not rows:
+            return rows
+        try:
+            if len(rows) < int(getattr(cfg, "min_candidates", 3)):
+                return rows
+            from plugins.memory.chromadb.atlas_fi import rerank_rows
+            return rerank_rows(
+                query,
+                rows,
+                score_weight=float(getattr(cfg, "score_weight", 0.35)),
+                max_candidates=int(getattr(cfg, "max_candidates", 80)),
+                annotate=bool(getattr(cfg, "annotate_results", True)),
+            )
+        except Exception as e:
+            logger.debug("Atlas FI runtime rerank failed: %s", e)
+            return rows
+
+    # -- System prompt block ------------------------------------------------
+
+    def _sanitize_team_context_for_prompt(self, text: str) -> str:
+        """Render team context without allowing prompt wrapper spoofing."""
+        if not text:
+            return ""
+        try:
+            from plugins.memory.chromadb.prompt_profile import sanitize_fact
+        except Exception:
+            sanitize_fact = None  # type: ignore[assignment]
+
+        lines: List[str] = []
+        for line in str(text).splitlines():
+            if sanitize_fact is None:
+                cleaned = line
+            else:
+                cleaned, _demoted = sanitize_fact(line)
+            lines.append(cleaned)
+        return "\n".join(lines)
+
+    def memory_profile_prompt_block(self) -> str:
+        """Return only provider-owned generated profile text for core policy."""
+        return self._build_generated_profile_block()
+
+    def _system_prompt_block_from_generated_profile(self, generated: str) -> str:
+        """Render provider prompt text using an already-built profile block."""
+        if self._cron_skipped or not self._available:
+            if not self._cron_skipped and not self._available:
+                self._append_boot_unavailable_receipt("chroma_unreachable")
+            return ""
+
+        parts = []
+        parts.append(
+            "# ChromaDB Vector Memory\n"
+            "Active. Semantic search across 7 collections. Use team_memory and "
+            "vector_search tools to store/retrieve knowledge."
+        )
+        if self._atlas_fi_enabled():
+            parts.append(
+                "\n## Atlas FI Runtime Memory\n"
+                "Active. Chroma candidate sets are reranked by the Atlas finite "
+                "claim/event + valid-abstraction FI pullback chart before runtime recall."
+            )
+
+        if self._team_context:
+            team_context = self._sanitize_team_context_for_prompt(self._team_context)
+            if team_context:
+                parts.append(f"\n## Team Knowledge\n{team_context}")
+
+        if generated:
+            parts.append(generated)
+
+        return "\n".join(parts)
+
+    def system_prompt_block_with_memory_profile(self) -> tuple[str, str]:
+        """Return rendered provider prompt and the exact generated profile in it."""
+        generated = self._build_generated_profile_block()
+        return self._system_prompt_block_from_generated_profile(generated), generated
+
+    def system_prompt_block(self) -> str:
+        """Return team knowledge context for the system prompt.
+
+        Phase 1 (Lane B): may additionally append a bounded
+        ``<memory-profile>`` block generated from vector memory when
+        ``prompt_source`` selects ``provider_with_legacy_fallback`` or
+        ``provider``.  In ``shadow`` mode the block is generated and cached
+        but NOT included in the returned text — operators get the
+        cache/debug artifact without changing the live prompt.
+
+        Team-knowledge injection is invariant across all prompt-source
+        modes (plan §"Generated Prompt Block Contract").
+        """
+        generated = self._build_generated_profile_block()
+        return self._system_prompt_block_from_generated_profile(generated)
+
+    # -- Generated profile (Phase 1 / Lane B) -------------------------------
+
+    def _generated_profile_should_run(self) -> bool:
+        """Gate every condition described in the plan in one place."""
+        if self._cron_skipped or not self._available:
+            return False
+        if not self._generated_profile_enabled:
+            return False
+        if self._prompt_source == "legacy":
+            return False
+        if self._agent_context in ("cron", "subagent", "flush"):
+            return False
+        if self._config is None:
+            return False
+        return True
+
+    def _search_for_generated(self, target: str, *, legacy_pre_g1a: bool = False) -> List[Dict[str, Any]]:
+        """Run a single ``_query()`` for the target and return ranked facts.
+
+        Tests monkeypatch ``_query``/``_embed`` directly on the provider
+        instance, so this method must go through ``self._query(...)`` and
+        never call ``collection.query(...)`` directly.
+        """
+        from plugins.memory.chromadb.prompt_profile import rank_facts
+
+        gp = self._config.generated_profile  # type: ignore[union-attr]
+        if target == "user":
+            query = gp.user_query
+            n = max(1, int(gp.max_user_facts))
+        else:
+            query = gp.memory_query
+            n = max(1, int(gp.max_memory_facts))
+
+        collection = self._get_collection(target)
+        if collection is None:
+            return []
+        try:
+            raw = self._query(
+                collection,
+                query,
+                n_results=n,
+                where={"target": target},
+            )
+        except Exception as e:
+            logger.debug("ChromaDB generated profile query for %s failed: %s", target, e)
+            raise
+        formatted = self._format_results(raw)
+        return rank_facts(formatted, min_confidence=gp.min_confidence, legacy_pre_g1a=legacy_pre_g1a)
+
+    def _build_legacy_generated_profile_block(self) -> str:
+        """Pre-G1A deterministic generated-profile path.
+
+        The G1A kill switch must be bit-identical to this path. Keep this
+        method side-effect-compatible with the previous implementation (cache
+        writes only; no boot-synthesis receipt decisions here).
+        """
+        if not self._generated_profile_should_run():
+            return ""
+
+        try:
+            from plugins.memory.chromadb.prompt_profile import (
+                compute_cache_key,
+                render_profile_block,
+            )
+            from plugins.memory.chromadb.prompt_cache import write_cache
+
+            gp = self._config.generated_profile  # type: ignore[union-attr]
+
+            user_facts = self._search_for_generated("user", legacy_pre_g1a=True)
+            memory_facts = self._search_for_generated("memory", legacy_pre_g1a=True)
+
+            collection_names = sorted((self._config.collections or {}).values())  # type: ignore[union-attr]
+            selected_ids = [f.get("id", "") for f in user_facts + memory_facts]
+            cache_key = compute_cache_key(
+                profile=self._agent_name,
+                collection_names=collection_names,
+                selected_fact_ids=selected_ids,
+                config_version=gp.config_version,
+            )
+
+            no_selected_facts = not user_facts and not memory_facts
+            block, receipt = render_profile_block(
+                user_facts=user_facts,
+                memory_facts=memory_facts,
+                max_user_chars=gp.max_user_chars,
+                max_memory_chars=gp.max_memory_chars,
+                cache_key=cache_key,
+                degraded=no_selected_facts,
+                include_debug_header=False,
+            )
+
+            if self._hermes_home:
+                try:
+                    write_cache(
+                        self._hermes_home,
+                        profile=self._agent_name,
+                        cache_key=cache_key,
+                        target="profile",
+                        payload={
+                            "block": block,
+                            "receipt": receipt,
+                            "generated_at": time.time(),
+                        },
+                    )
+                except Exception as e:
+                    logger.debug("ChromaDB cache write failed: %s", e)
+
+            # Shadow mode: cache only, never alter the returned prompt block.
+            if self._prompt_source == "shadow":
+                return ""
+            if self._prompt_source in ("provider_with_legacy_fallback", "provider"):
+                return block
+            return ""
+        except Exception as e:
+            logger.debug("ChromaDB generated profile failed: %s — degrading", e)
+            return ""
+
+    def _append_boot_synthesis_receipt(self, receipt: Dict[str, Any]) -> None:
+        from plugins.memory.chromadb.g1a import BootSynthesisReceiptWriter
+
+        if not self._hermes_home:
+            return
+        writer = BootSynthesisReceiptWriter(self._hermes_home)
+        guard = f"{self._session_id}:chromadb:boot"
+        if guard in self._boot_receipt_guarded:
+            return
+        self._boot_receipt_guarded.add(guard)
+        writer.append_once(receipt, guard_key=guard)
+
+    def _append_boot_unavailable_receipt(self, reason: str) -> None:
+        """Append the required one-per-boot receipt when Chroma is unavailable."""
+        if (
+            not self._generated_profile_enabled
+            or self._prompt_source == "legacy"
+            or self._agent_context in ("cron", "subagent", "flush")
+            or not self._boot_synthesis_enabled
+        ):
+            return
+        from plugins.memory.chromadb import g1a
+
+        home = self._hermes_home or str(Path.home() / ".hermes")
+        writer = g1a.BootSynthesisReceiptWriter(home)
+        receipt = writer.base_receipt(
+            session_id=self._session_id,
+            platform=self._platform,
+            gateway_session_key=self._gateway_session_key,
+        )
+        receipt.update({
+            "query_strings": [],
+            "collections_searched": ["agent_memories"],
+            "candidates": [],
+            "selected_ids": [],
+            "dropped_ids": [],
+            "pre_dedup_count": 0,
+            "post_dedup_count": 0,
+            "model": g1a.SYNTHESIS_MODEL,
+            "input_chars": 0,
+            "output_chars": 0,
+            "latency_ms": 0,
+            "fallback_path_taken": True,
+            "fallback_reason": reason,
+            "output_sha256": g1a.sha256_text(""),
+            "previous_block_sha256": g1a.previous_receipt_info(home)[0],
+            "diff_summary": None,
+            "output_text_preview": "",
+        })
+        self._append_boot_synthesis_receipt(receipt)
+
+    def _build_generated_profile_block(self) -> str:
+        """Generate the G1A synthesized boot block with receipt and fallback."""
+        if not self._generated_profile_should_run():
+            return ""
+
+        from plugins.memory.chromadb import g1a
+
+        started = time.time()
+        writer = g1a.BootSynthesisReceiptWriter(self._hermes_home or str(Path.home() / ".hermes"))
+        receipt = writer.base_receipt(
+            session_id=self._session_id,
+            platform=self._platform,
+            gateway_session_key=self._gateway_session_key,
+        )
+        receipt.update({
+            "query_strings": [],
+            "collections_searched": ["agent_memories"],
+            "candidates": [],
+            "selected_ids": [],
+            "dropped_ids": [],
+            "pre_dedup_count": 0,
+            "post_dedup_count": 0,
+            "model": g1a.SYNTHESIS_MODEL,
+            "input_chars": 0,
+            "output_chars": 0,
+            "latency_ms": 0,
+            "fallback_path_taken": False,
+            "fallback_reason": None,
+            "output_sha256": g1a.sha256_text(""),
+            "previous_block_sha256": None,
+            "diff_summary": None,
+        })
+
+        def _finish(block: str, *, fallback: bool, reason: Optional[str], model: str) -> str:
+            prev_sha, prev_preview = g1a.previous_receipt_info(self._hermes_home or str(Path.home() / ".hermes"))
+            receipt.update({
+                "model": model,
+                "output_chars": len(block or ""),
+                "latency_ms": int((time.time() - started) * 1000),
+                "fallback_path_taken": bool(fallback),
+                "fallback_reason": reason,
+                "output_sha256": g1a.sha256_text(block or ""),
+                "previous_block_sha256": prev_sha,
+                "diff_summary": g1a.diff_summary(prev_preview, block or ""),
+                "output_text": block or "",
+                "output_text_preview": (block or "")[:1000],
+            })
+            self._append_boot_synthesis_receipt(receipt)
+            return block
+
+        if not self._boot_synthesis_enabled:
+            legacy = self._build_legacy_generated_profile_block()
+            return _finish(legacy, fallback=True, reason="kill_switch_off", model="legacy")
+
+        try:
+            gp = self._config.generated_profile  # type: ignore[union-attr]
+            receipt["query_strings"] = [gp.user_query, gp.memory_query]
+            user_facts = self._search_for_generated("user")
+            memory_facts = self._search_for_generated("memory")
+            candidates = user_facts + memory_facts
+            scored = g1a.score_results(candidates)
+            filtered, dropped_filter = g1a.filter_candidates(scored)
+            deduped, dropped_dedup = g1a.deduplicate_candidates(filtered, embed_fn=self._embed)
+            receipt.update({
+                "pre_dedup_count": len(filtered),
+                "post_dedup_count": len(deduped),
+                "candidates": [g1a.candidate_receipt(c) for c in scored],
+                "dropped_ids": dropped_filter + dropped_dedup,
+            })
+            selected_user = [c for c in deduped if (c.get("metadata") or {}).get("target") == "user"]
+            selected_memory = [c for c in deduped if (c.get("metadata") or {}).get("target") != "user"]
+            selected = selected_user + selected_memory
+            prompt_selected = g1a.select_synthesis_candidates(selected, limit=8)
+            prompt_selected_ids = {c.get("id", "") for c in prompt_selected}
+            over_budget = [g1a._drop(c, "over_budget") for c in selected if c.get("id", "") not in prompt_selected_ids]
+            receipt["dropped_ids"] = receipt["dropped_ids"] + over_budget
+            receipt["selected_ids"] = [c.get("id", "") for c in prompt_selected]
+            if not prompt_selected:
+                legacy = self._build_legacy_generated_profile_block()
+                return _finish(legacy, fallback=True, reason="exception", model=g1a.SYNTHESIS_MODEL)
+            prompt = g1a.build_synthesis_prompt(prompt_selected, max_chars=gp.max_memory_chars)
+            receipt["input_chars"] = len(prompt)
+            block = g1a.synthesize_with_ollama(prompt=prompt)
+            block = g1a.enforce_budget(block, gp.max_memory_chars)
+            if self._prompt_source == "shadow":
+                return _finish("", fallback=False, reason=None, model=g1a.SYNTHESIS_MODEL)
+            return _finish(block, fallback=False, reason=None, model=g1a.SYNTHESIS_MODEL)
+        except g1a.ModelTimeout:
+            legacy = self._build_legacy_generated_profile_block()
+            return _finish(legacy, fallback=True, reason="timeout", model=g1a.SYNTHESIS_MODEL)
+        except g1a.EmptyOutput:
+            legacy = self._build_legacy_generated_profile_block()
+            return _finish(legacy, fallback=True, reason="empty_output", model=g1a.SYNTHESIS_MODEL)
+        except g1a.ModelUnavailable:
+            legacy = self._build_legacy_generated_profile_block()
+            return _finish(legacy, fallback=True, reason="model_unreachable", model=g1a.SYNTHESIS_MODEL)
+        except g1a.MalformedOutput:
+            legacy = self._build_legacy_generated_profile_block()
+            return _finish(legacy, fallback=True, reason="malformed_output", model=g1a.SYNTHESIS_MODEL)
+        except g1a.UnsafeOutput:
+            legacy = self._build_legacy_generated_profile_block()
+            return _finish(legacy, fallback=True, reason="unsafe_output", model=g1a.SYNTHESIS_MODEL)
+        except Exception as e:
+            logger.debug("G1A boot synthesis failed: %s — using legacy path", e)
+            legacy = self._build_legacy_generated_profile_block()
+            return _finish(legacy, fallback=True, reason="exception", model=g1a.SYNTHESIS_MODEL)
+
+    # -- Prefetch / recall ---------------------------------------------------
+
+    def _append_recall_event(self, event_type: str, *, context_sha256: str = "", **extra: Any) -> None:
+        try:
+            from plugins.memory.chromadb.g1b_observability import append_feedback_event, feedback_path_for_home
+            append_feedback_event(
+                feedback_path_for_home(self._hermes_home),
+                event_type=event_type,
+                session_id=str(extra.pop("session_id", "") or self._session_id),
+                platform=str(extra.pop("platform", "") or self._platform or "cli"),
+                gateway_session_key=extra.pop("gateway_session_key", self._gateway_session_key),
+                context_sha256=context_sha256,
+                **extra,
+            )
+        except Exception as e:
+            logger.debug("ChromaDB G2 recall feedback failed: %s", e)
+
+    def enforced_recall(self, query: str, *, first_turn: bool, session_id: str = "") -> str:
+        """Synchronous read-only G2 recall for high-risk current turns."""
+        start = time.monotonic()
+        from agent.recall_gate import build_queries, classify_risk, render_degraded_notice
+        from plugins.memory.chromadb import g2_recall
+
+        risk = classify_risk(query or "")
+        context_sha = hashlib.sha256((query or "").encode("utf-8")).hexdigest()
+        queries = build_queries(query or "", risk)
+        labels = list(risk.labels)
+        collections_searched = ["memories", "sessions", f"agent_{self._agent_name}"]
+        if "fleet_project" in risk.risk_classes:
+            collections_searched.extend(["team_knowledge", "team_ops"])
+
+        elapsed_ms = lambda: int((time.monotonic() - start) * 1000)
+
+        if not risk.mandatory and risk.level == "no_recall":
+            self._append_recall_event(
+                "recall_skipped",
+                context_sha256=context_sha,
+                labels=[],
+                first_turn=bool(first_turn),
+                mandatory=False,
+                risk_class="no_recall",
+                query_count=0,
+                collections_searched=[],
+                skip_reason="not_triggered",
+                latency_ms=elapsed_ms(),
+                session_id=session_id,
+            )
+            return ""
+
+        self._append_recall_event(
+            "recall_needed",
+            context_sha256=context_sha,
+            labels=labels,
+            first_turn=bool(first_turn),
+            mandatory=bool(risk.mandatory),
+            risk_class="+".join(risk.risk_classes),
+            query_count=len(queries),
+            collections_searched=collections_searched,
+            latency_ms=0,
+            session_id=session_id,
+        )
+
+        if self._cron_skipped or not self._available:
+            self._append_recall_event(
+                "recall_skipped",
+                context_sha256=context_sha,
+                labels=labels,
+                first_turn=bool(first_turn),
+                mandatory=bool(risk.mandatory),
+                risk_class="+".join(risk.risk_classes),
+                skip_reason="chroma_unavailable",
+                latency_ms=elapsed_ms(),
+                session_id=session_id,
+            )
+            return render_degraded_notice(risk) if risk.mandatory else ""
+
+        try:
+            embeddings = self._embed_with_timeout(queries, timeout_seconds=4.0)
+        except concurrent.futures.TimeoutError:
+            self._append_recall_event(
+                "recall_skipped", context_sha256=context_sha, labels=labels,
+                first_turn=bool(first_turn), mandatory=bool(risk.mandatory),
+                risk_class="+".join(risk.risk_classes), skip_reason="timeout",
+                latency_ms=elapsed_ms(), session_id=session_id,
+            )
+            return render_degraded_notice(risk) if risk.mandatory else ""
+        except Exception:
+            self._append_recall_event(
+                "recall_skipped", context_sha256=context_sha, labels=labels,
+                first_turn=bool(first_turn), mandatory=bool(risk.mandatory),
+                risk_class="+".join(risk.risk_classes), skip_reason="embedding_unavailable",
+                latency_ms=elapsed_ms(), session_id=session_id,
+            )
+            return render_degraded_notice(risk) if risk.mandatory else ""
+
+        raw_candidates: list[g2_recall.RecallCandidate] = []
+        deadline = start + 4.8
+        collection_keys = ["memories", "sessions", f"agent_{self._agent_name}"]
+        if "fleet_project" in risk.risk_classes:
+            collection_keys.extend(["team_knowledge", "team_ops"])
+        for query_index, embedding in enumerate(embeddings):
+            for key in collection_keys:
+                if time.monotonic() > deadline:
+                    break
+                collection = self._collections.get(key)
+                if collection is None:
+                    continue
+                try:
+                    where = None
+                    raw = self._query_with_vector_timeout(collection, embedding, n_results=12, where=where, timeout_seconds=max(0.1, deadline - time.monotonic()))
+                    rows = self._score_results(self._format_results(raw))
+                    rows.sort(key=lambda item: item.get("composite_score", 0), reverse=True)
+                    for rank, row in enumerate(rows, start=1):
+                        cand = g2_recall.candidate_from_row(row, collection=key, rank=rank, query_index=query_index)
+                        # Conservative G2-only ephemeral fallback for transient ops.
+                        if cand.durability in {"", "unknown"}:
+                            lowered = cand.content.lower()
+                            if "pr #" in lowered or "commit" in lowered or "temporary" in lowered:
+                                cand.durability = "ephemeral"
+                        raw_candidates.append(cand)
+                except Exception:
+                    continue
+
+        deduped, dup_drops = g2_recall.dedup_candidates(raw_candidates)
+        allow_ephemeral = "fleet_project" in risk.risk_classes
+        filtered, eph_drops = g2_recall.filter_ephemeral(deduped, allow_ephemeral=allow_ephemeral)
+        selected = g2_recall.select_within_limits(filtered)
+        block = ""
+        injected_selected = []
+        if selected:
+            block, injected_selected = g2_recall.render_recall_block_with_candidates(selected, risk, char_budget=3500)
+        over_budget_drops = {
+            c.fact_id: "over_budget"
+            for c in selected
+            if c.fact_id not in {kept.fact_id for kept in injected_selected}
+        }
+
+        if not injected_selected or not block.strip():
+            self._append_recall_event(
+                "recall_skipped",
+                context_sha256=context_sha,
+                labels=labels,
+                first_turn=bool(first_turn),
+                mandatory=bool(risk.mandatory),
+                risk_class="+".join(risk.risk_classes),
+                skip_reason="no_candidates",
+                latency_ms=elapsed_ms(),
+                dropped_ids={**dup_drops, **eph_drops, **over_budget_drops},
+                session_id=session_id,
+            )
+            return render_degraded_notice(risk) if risk.mandatory else ""
+
+        for idx, cand in enumerate(injected_selected, start=1):
+            self._append_recall_event(
+                "recall_retrieved",
+                context_sha256=context_sha,
+                labels=labels,
+                fact_id=cand.fact_id,
+                collection=cand.collection,
+                source=cand.source,
+                target=cand.target,
+                rank=idx,
+                query_index=cand.query_index,
+                score=cand.score,
+                durability=cand.durability,
+                latency_ms=elapsed_ms(),
+                session_id=session_id,
+            )
+        self._append_recall_event(
+            "recall_used",
+            context_sha256=context_sha,
+            labels=labels,
+            first_turn=bool(first_turn),
+            mandatory=bool(risk.mandatory),
+            risk_class="+".join(risk.risk_classes),
+            injected_chars=len(block),
+            total_latency_ms=elapsed_ms(),
+            latency_ms=elapsed_ms(),
+            selected_ids=[c.fact_id for c in injected_selected],
+            dropped_ids={**dup_drops, **eph_drops, **over_budget_drops},
+            session_id=session_id,
+        )
+        return block
+
+    def prefetch(self, query: str, *, session_id: str = "") -> str:
+        """Return prefetched vector memory context from background thread."""
+        if self._cron_skipped or not self._available:
+            return ""
+
+        # Wait for background prefetch if running
+        if self._prefetch_thread and self._prefetch_thread.is_alive():
+            self._prefetch_thread.join(timeout=3.0)
+
+        with self._prefetch_lock:
+            result = self._prefetch_result
+            self._prefetch_result = ""
+
+        if not result:
+            return ""
+
+        return f"## Vector Memory Recall\n{result}"
+
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        """Fire a background semantic search for the next turn."""
+        if self._cron_skipped or not self._available or not query:
+            return
+
+        def _run():
+            try:
+                # Search agent_memories for relevant context
+                relevant = self.get_relevant_memories(
+                    query, "memory",
+                    char_budget=self._config.default_char_budget if self._config else 2200,
+                )
+                if relevant and relevant.strip():
+                    with self._prefetch_lock:
+                        self._prefetch_result = relevant
+            except Exception as e:
+                logger.debug("ChromaDB prefetch failed: %s", e)
+
+        self._prefetch_thread = threading.Thread(
+            target=_run, daemon=True, name="chromadb-prefetch"
+        )
+        self._prefetch_thread.start()
+
+    # -- Sync turn ----------------------------------------------------------
+
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+        """Lightweight turn recording — queue for background processing."""
+        if self._cron_skipped or not self._available:
+            return
+
+        # Keep lightweight: just record the turn in a background thread
+        def _sync():
+            try:
+                # Store a compact turn record in session_history
+                turn_text = f"User: {user_content[:500]}\nAssistant: {assistant_content[:500]}"
+                turn_id = f"turn_{session_id or self._session_id}_{int(time.time())}"
+                collection = self._collections.get("sessions")
+                if collection:
+                    meta = self._enrich_fi_write_metadata(turn_text, {
+                        "session_id": session_id or self._session_id,
+                        "stored_at": time.time(),
+                        "target": "session_turn",
+                        "importance": 0.3,
+                    })
+                    self._upsert(
+                        collection,
+                        ids=[turn_id],
+                        documents=[turn_text],
+                        metadatas=[self._sanitize_metadata(meta)],
+                    )
+            except Exception as e:
+                logger.debug("ChromaDB sync_turn failed: %s", e)
+
+        if self._sync_thread and self._sync_thread.is_alive():
+            self._sync_thread.join(timeout=5.0)
+        self._sync_thread = threading.Thread(
+            target=_sync, daemon=True, name="chromadb-sync"
+        )
+        self._sync_thread.start()
+
+    # -- Memory write mirror (Approach A) -----------------------------------
+
+    def on_memory_write(self, action: str, target: str, content: str) -> None:
+        """Mirror built-in memory writes to ChromaDB."""
+        if self._cron_skipped or not self._available or not content:
+            return
+
+        # Invalidate cached generated profile for the affected target so
+        # the next session prompt build picks up fresh content (plan
+        # global rule §14).  Best-effort — never raises.
+        if target in ("user", "memory") and self._hermes_home:
+            try:
+                from plugins.memory.chromadb.prompt_cache import invalidate_target
+                invalidate_target(
+                    self._hermes_home,
+                    profile=self._agent_name,
+                    target=target,
+                )
+                # Generated profile caches combine user + memory facts into a
+                # target="profile" artifact; any user/memory mutation makes
+                # that combined artifact stale too.
+                invalidate_target(
+                    self._hermes_home,
+                    profile=self._agent_name,
+                    target="profile",
+                )
+            except Exception as e:
+                logger.debug("ChromaDB cache invalidation failed: %s", e)
+
+        def _write():
+            try:
+                if action == "add":
+                    self.store_memory(content, target, {"source": "builtin_mirror"})
+                elif action == "replace":
+                    self.store_memory(content, target, {"source": "builtin_mirror"})
+                elif action == "remove":
+                    # Find and remove by content hash
+                    doc_id = self._make_id(content, target)
+                    self.remove_memory(doc_id, target)
+            except Exception as e:
+                logger.debug("ChromaDB memory mirror failed: %s", e)
+
+        t = threading.Thread(target=_write, daemon=True, name="chromadb-memwrite")
+        t.start()
+
+    # -- Tool schemas -------------------------------------------------------
+
+    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        """Return team_memory and vector_search tool schemas.
+
+        Tool routing is registered before provider initialization completes, so
+        schemas must be exposed even while `_available` is still False. Runtime
+        calls still fail closed in `handle_tool_call()` if ChromaDB is not ready.
+        """
+        if self._cron_skipped:
+            return []
+        return [TEAM_MEMORY_SCHEMA, VECTOR_SEARCH_SCHEMA]
+
+    # -- Tool call routing --------------------------------------------------
+
+    def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        """Route tool calls to team_memory or vector_search handlers."""
+        if self._cron_skipped:
+            return json.dumps({"error": "ChromaDB is not active (cron context)."})
+
+        if not self._available:
+            return json.dumps({"error": "ChromaDB is not available."})
+
+        try:
+            if tool_name == "team_memory":
+                return self._handle_team_memory(args)
+            elif tool_name == "vector_search":
+                return self._handle_vector_search(args)
+            return json.dumps({"error": f"Unknown tool: {tool_name}"})
+        except Exception as e:
+            logger.error("ChromaDB tool %s failed: %s", tool_name, e)
+            return json.dumps({"error": f"ChromaDB {tool_name} failed: {e}"})
+
+    def _handle_team_memory(self, args: Dict[str, Any]) -> str:
+        """Handle team_memory tool calls (store_discovery / search_knowledge)."""
+        action = args.get("action", "")
+        content = args.get("content", "")
+        collection = args.get("collection", "team_knowledge")
+        query = args.get("query", "")
+        agent_name = self._agent_name
+
+        if action == "store_discovery":
+            if not content or not content.strip():
+                return json.dumps({"status": "error", "error": "Content is required for store_discovery."})
+
+            valid_collections = {"team_knowledge", "team_ops", "own"}
+            if collection not in valid_collections:
+                return json.dumps({"status": "error", "error": f"Invalid collection '{collection}'."})
+
+            metadata = {"source_agent": agent_name}
+
+            try:
+                if collection == "team_knowledge":
+                    memory_id = self.store_team_knowledge(content, metadata=metadata)
+                elif collection == "team_ops":
+                    memory_id = self.store_team_ops(content, agent_name=agent_name, metadata=metadata)
+                elif collection == "own":
+                    memory_id = self.store_agent_memory(content, agent_name=agent_name, metadata=metadata)
+                else:
+                    return json.dumps({"status": "error", "error": f"Unhandled collection '{collection}'."})
+
+                if memory_id:
+                    return json.dumps({
+                        "status": "ok",
+                        "memory_id": memory_id,
+                        "collection": collection if collection != "own" else f"agent_{agent_name}",
+                        "message": f"Discovery stored in {collection}.",
+                    })
+                else:
+                    return json.dumps({"status": "error", "error": "Store returned empty ID."})
+
+            except Exception as e:
+                logger.warning("team_memory store_discovery failed: %s", e)
+                return json.dumps({"status": "error", "error": f"Failed to store discovery: {e}"})
+
+        elif action == "search_knowledge":
+            if not query or not query.strip():
+                return json.dumps({"status": "error", "error": "Query is required for search_knowledge."})
+
+            try:
+                results = []
+                if collection == "own":
+                    results = self.search_agent_memory(query, agent_name=agent_name, n_results=5)
+                elif collection == "team_knowledge":
+                    tk = self.search_team_knowledge(query, n_results=5)
+                    own = self.search_agent_memory(query, agent_name=agent_name, n_results=5)
+                    results = tk + own
+                elif collection == "team_ops":
+                    results = self.search_team_ops(query, n_results=5)
+                else:
+                    tk = self.search_team_knowledge(query, n_results=5)
+                    own = self.search_agent_memory(query, agent_name=agent_name, n_results=5)
+                    results = tk + own
+
+                scored = self._score_results(results)
+                scored = self._atlas_fi_rerank(query, scored)
+                scored.sort(key=lambda x: x.get("composite_score", 0), reverse=True)
+
+                entries = []
+                for r in scored[:10]:
+                    entry = {
+                        "content": r.get("content", ""),
+                        "score": round(r.get("composite_score", 0), 4),
+                        "metadata": r.get("metadata", {}),
+                    }
+                    if "atlas_fi_score" in r:
+                        entry["atlas_fi"] = {
+                            "score": round(float(r.get("atlas_fi_score", 0.0) or 0.0), 4),
+                            "distance": round(float(r.get("atlas_fi_distance", 0.0) or 0.0), 4),
+                            "penalty": round(float(r.get("atlas_fi_penalty", 0.0) or 0.0), 4),
+                        }
+                    entries.append(entry)
+
+                return json.dumps({"status": "ok", "results": entries, "count": len(entries)})
+
+            except Exception as e:
+                logger.warning("team_memory search_knowledge failed: %s", e)
+                return json.dumps({"status": "error", "error": f"Search failed: {e}"})
+
+        return json.dumps({"status": "error", "error": f"Unknown action '{action}'."})
+
+    def _handle_vector_search(self, args: Dict[str, Any]) -> str:
+        """Handle vector_search tool calls."""
+        query = args.get("query", "")
+        if not query:
+            return json.dumps({"error": "Missing required parameter: query"})
+
+        collection = args.get("collection", "memories")
+        n_results = min(int(args.get("n_results", 5)), 20)
+
+        try:
+            if collection == "all":
+                results = self.search_all_accessible(query, agent_name=self._agent_name, n_results=n_results)
+            elif collection == "memories":
+                results = self.search_memories(query, "memory", n_results=n_results)
+            elif collection == "sessions":
+                results = self.search_sessions(query, n_results=n_results)
+            elif collection == "team_knowledge":
+                results = self.search_team_knowledge(query, n_results=n_results)
+            elif collection == "team_ops":
+                results = self.search_team_ops(query, n_results=n_results)
+            else:
+                results = self.search_memories(query, "memory", n_results=n_results)
+
+            scored = self._score_results(results)
+            scored = self._atlas_fi_rerank(query, scored)
+            scored.sort(key=lambda x: x.get("composite_score", 0), reverse=True)
+
+            entries = []
+            for r in scored[:n_results]:
+                entry = {
+                    "content": r.get("content", ""),
+                    "score": round(r.get("composite_score", 0), 4),
+                    "similarity": round(r.get("similarity", 0), 4),
+                    "metadata": r.get("metadata", {}),
+                }
+                if "atlas_fi_score" in r:
+                    entry["atlas_fi"] = {
+                        "score": round(float(r.get("atlas_fi_score", 0.0) or 0.0), 4),
+                        "distance": round(float(r.get("atlas_fi_distance", 0.0) or 0.0), 4),
+                        "penalty": round(float(r.get("atlas_fi_penalty", 0.0) or 0.0), 4),
+                    }
+                entries.append(entry)
+
+            return json.dumps({"status": "ok", "results": entries, "count": len(entries)})
+
+        except Exception as e:
+            logger.warning("vector_search failed: %s", e)
+            return json.dumps({"error": f"Vector search failed: {e}"})
+
+    # -- Turn-start observability --------------------------------------------
+
+    def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        """Append local G1B correction-marker feedback events.
+
+        This hook is intentionally independent of Chroma availability. It does
+        not touch vector stores or flat-file memory; it only appends structured,
+        raw-text-free marker events to $HERMES_HOME/logs/memory_feedback.jsonl.
+        """
+        try:
+            from plugins.memory.chromadb.g1b_observability import (
+                append_feedback_event,
+                extract_correction_markers,
+                feedback_path_for_home,
+            )
+
+            markers = extract_correction_markers(message or "")
+            if not markers:
+                return
+            platform = str(kwargs.get("platform") or self._platform or "cli")
+            gateway_session_key = kwargs.get("gateway_session_key", self._gateway_session_key)
+            path = feedback_path_for_home(self._hermes_home)
+            for marker in markers:
+                append_feedback_event(
+                    path,
+                    event_type="correction_marker",
+                    session_id=self._session_id,
+                    platform=platform,
+                    gateway_session_key=gateway_session_key,
+                    labels=[str(marker.get("label") or "")],
+                    context_sha256=str(marker.get("span_sha256") or ""),
+                    marker_start=marker.get("start"),
+                    marker_end=marker.get("end"),
+                )
+        except Exception as e:
+            logger.debug("ChromaDB G1B correction marker feedback failed: %s", e)
+
+    # -- Delegation hook ----------------------------------------------------
+
+    def on_delegation(self, task: str, result: str, *,
+                      child_session_id: str = "", **kwargs) -> None:
+        """Store subagent results in team_ops collection."""
+        if self._cron_skipped or not self._available:
+            return
+
+        def _store():
+            try:
+                child_agent = kwargs.get("agent_identity", "subagent")
+                content = f"[{child_agent}] Task: {task[:500]}\nResult: {result[:1000]}"
+                self.store_team_ops(
+                    content,
+                    agent_name=child_agent,
+                    metadata={
+                        "parent_session": self._session_id,
+                        "child_session": child_session_id,
+                        "delegation_type": "subagent_result",
+                    },
+                )
+            except Exception as e:
+                logger.debug("ChromaDB on_delegation failed: %s", e)
+
+        t = threading.Thread(target=_store, daemon=True, name="chromadb-delegation")
+        t.start()
+
+    # -- Pre-compress hook --------------------------------------------------
+
+    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+        """Extract important facts from messages before context compression."""
+        if self._cron_skipped or not self._available:
+            return ""
+
+        try:
+            consolidator = self._get_consolidator()
+            facts = consolidator.extract_facts_from_messages(messages)
+
+            if not facts:
+                return ""
+
+            # Store extracted facts in ChromaDB
+            for fact in facts:
+                try:
+                    self.store_memory(fact, "memory", {
+                        "importance": 0.8,
+                        "source": "pre_compress_extraction",
+                    })
+                except Exception:
+                    pass
+
+            return "Extracted facts preserved in vector memory:\n" + "\n".join(f"- {f}" for f in facts[:10])
+
+        except Exception as e:
+            logger.debug("ChromaDB on_pre_compress failed: %s", e)
+            return ""
+
+    # -- Session end hook ---------------------------------------------------
+
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        """Store session summary in session_history collection."""
+        if self._cron_skipped or not self._available:
+            return
+
+        # Wait for pending sync
+        if self._sync_thread and self._sync_thread.is_alive():
+            self._sync_thread.join(timeout=10.0)
+
+        try:
+            # Build a compact summary from messages
+            summary_parts = []
+            msg_count = 0
+            for msg in messages:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if not content or not isinstance(content, str):
+                    continue
+                if role in ("user", "assistant"):
+                    summary_parts.append(f"{role}: {content[:200]}")
+                    msg_count += 1
+
+            if not summary_parts:
+                return
+
+            summary = f"Session {self._session_id} ({msg_count} messages):\n"
+            summary += "\n".join(summary_parts[:20])  # Cap at 20 turns
+            summary = summary[:3000]  # Cap total length
+
+            self.store_session_summary(
+                self._session_id,
+                summary,
+                metadata={
+                    "message_count": msg_count,
+                    "agent_name": self._agent_name,
+                },
+            )
+        except Exception as e:
+            logger.debug("ChromaDB on_session_end failed: %s", e)
+
+    # -- Shutdown -----------------------------------------------------------
+
+    def shutdown(self) -> None:
+        """Clean shutdown — wait for background threads."""
+        for t in (self._prefetch_thread, self._sync_thread):
+            if t and t.is_alive():
+                t.join(timeout=5.0)
+        # ChromaDB HttpClient doesn't need explicit close, but clear references
+        self._client = None
+        self._collections = {}
+        self._available = False
+
+    # ======================================================================
+    # Core vector memory methods (ported from VectorMemoryProvider)
+    # ======================================================================
+
+    def _get_collection(self, target: str):
+        """Get the ChromaDB collection for a target type."""
+        if target in ("memory", "user"):
+            return self._collections.get("memories")
+        elif target == "session":
+            return self._collections.get("sessions")
+        return self._collections.get("memories")
+
+    def _embed(self, texts: List[str]) -> List[List[float]]:
+        """Embed texts using the active embedding function (forge or OpenRouter).
+
+        Raises RuntimeError if no embedding function is available — callers
+        must not fall through to ChromaDB default/auto-embedding, which would
+        produce 384-dim vectors incompatible with existing 1024-dim collections.
+        """
+        if self._ef is None:
+            global _no_embedding_function_failure_count
+            _no_embedding_function_failure_count += 1
+            logger.error(
+                "CHROMADB_EMBED_UNAVAILABLE: refusing to embed %d text(s) — "
+                "no embedding provider reachable (forge + OpenRouter both failed). "
+                "Memory write/read will be silently dropped by caller. "
+                "Failure count this process: %d",
+                len(texts), _no_embedding_function_failure_count,
+            )
+            raise RuntimeError(
+                "No embedding provider available. Refusing to embed to protect "
+                "existing 1024-dim collections from dimension mismatch."
+            )
+        return self._ef(texts)
+
+    def _upsert(self, collection, ids, documents, metadatas=None):
+        """Upsert with explicit embeddings. Fails closed if no EF available."""
+        embeddings = self._embed(documents)  # raises if no EF
+        kwargs = {"ids": ids, "documents": documents, "embeddings": embeddings}
+        if metadatas:
+            kwargs["metadatas"] = metadatas
+        collection.upsert(**kwargs)
+
+    def _query(self, collection, query_text: str, n_results: int = 10,
+               where=None, include=None):
+        """Query with explicit embeddings. Fails closed if no EF available."""
+        if include is None:
+            include = ["documents", "metadatas", "distances"]
+        kwargs = {"n_results": n_results, "include": include}
+        if where:
+            kwargs["where"] = where
+        embeddings = self._embed([query_text])  # raises if no EF
+        kwargs["query_embeddings"] = embeddings
+        return collection.query(**kwargs)
+
+    def _embed_with_timeout(self, texts: List[str], timeout_seconds: float = 4.0):
+        """Embed texts under a wall-clock cap for G2 mandatory recall."""
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(self._embed, texts)
+        try:
+            return future.result(timeout=timeout_seconds)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    @staticmethod
+    def _query_with_vector(collection, embedding, n_results: int = 10, where=None):
+        """Query Chroma using a precomputed embedding to avoid repeated embeds."""
+        kwargs = {
+            "query_embeddings": [embedding],
+            "n_results": n_results,
+            "include": ["documents", "metadatas", "distances"],
+        }
+        if where:
+            kwargs["where"] = where
+        return collection.query(**kwargs)
+
+    def _query_with_vector_timeout(self, collection, embedding, n_results: int = 10, where=None, timeout_seconds: float = 1.0):
+        """Run a Chroma vector query under the remaining G2 recall deadline."""
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(self._query_with_vector, collection, embedding, n_results, where)
+        try:
+            return future.result(timeout=max(0.1, timeout_seconds))
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    @staticmethod
+    def _make_id(content: str, target: str) -> str:
+        """Generate a deterministic ID from content hash + target."""
+        h = hashlib.sha256(f"{target}:{content}".encode()).hexdigest()[:16]
+        return f"{target}_{h}"
+
+    @staticmethod
+    def _sanitize_metadata(meta: Dict[str, Any]) -> Dict[str, Any]:
+        """Ensure metadata values are ChromaDB-compatible scalar types."""
+        clean = {}
+        for k, v in meta.items():
+            if isinstance(v, (str, int, float, bool)):
+                clean[k] = v
+            elif v is None:
+                clean[k] = ""
+            else:
+                clean[k] = str(v)
+        return clean
+
+    @staticmethod
+    def _csv(values: Any, *, limit: int = 32) -> str:
+        """Render bounded Chroma-safe CSV metadata for FI atoms."""
+        out: list[str] = []
+        for value in values or []:
+            text = str(value or "").strip().lower().replace(",", " ")
+            if text and text not in out:
+                out.append(text)
+            if len(out) >= limit:
+                break
+        return ",".join(out)
+
+    def _enrich_fi_write_metadata(
+        self,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Attach Atlas FI claim/event metadata at write time.
+
+        Chroma remains the vector candidate generator, but memory writes should
+        not depend on retrieval-time text inference alone. This stores the
+        finite claim/event frame used by the runtime FI pullback reranker so
+        future retrieval can rank/filter against durable typed atoms.
+
+        Enrichment is fail-open for storage continuity: if FI extraction raises,
+        the memory still writes with ``fi_write_enriched=False`` instead of
+        dropping the user's memory.
+        """
+        meta = dict(metadata or {})
+        source_text = str(content or "")
+        try:
+            from plugins.memory.chromadb.atlas_fi import extract_claim_event_frame
+
+            frame = extract_claim_event_frame(
+                source_text,
+                speaker=str(meta.get("speaker") or meta.get("source_agent") or meta.get("agent_name") or ""),
+                is_query=False,
+            )
+            meta.setdefault("fi_schema_version", "atlas_fi_claim_event_v1")
+            meta["fi_write_enriched"] = True
+            meta.setdefault("status", "active")
+            meta.setdefault("source_text", source_text)
+            meta.setdefault("claim_types_csv", self._csv(frame.get("claim_types")))
+            meta.setdefault("subjects_csv", self._csv(frame.get("subjects")))
+            meta.setdefault("predicates_csv", self._csv(frame.get("predicates")))
+            meta.setdefault("objects_csv", self._csv(frame.get("objects")))
+            meta.setdefault("time_expressions_csv", self._csv(frame.get("time_expressions")))
+            meta.setdefault("resolved_dates_csv", self._csv(frame.get("resolved_dates")))
+            meta.setdefault("places_csv", self._csv(frame.get("places")))
+            meta.setdefault("emotions_csv", self._csv(frame.get("emotions")))
+            meta.setdefault("relationships_csv", self._csv(frame.get("relationships")))
+            meta.setdefault("supports_question_types_csv", self._csv(frame.get("supports_question_types")))
+            meta.setdefault("facets_csv", self._csv(frame.get("facets")))
+            meta.setdefault("keywords_csv", self._csv(frame.get("keywords"), limit=48))
+            meta.setdefault("context_terms_csv", self._csv(frame.get("keywords"), limit=24))
+        except Exception as e:
+            logger.debug("Atlas FI write metadata enrichment failed: %s", e)
+            meta.setdefault("fi_schema_version", "atlas_fi_claim_event_v1")
+            meta["fi_write_enriched"] = False
+            meta.setdefault("fi_write_error", type(e).__name__)
+            meta.setdefault("source_text", source_text)
+        return meta
+
+    # -- Store / search / remove memories -----------------------------------
+
+    def store_memory(
+        self, content: str, target: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Store a memory entry in ChromaDB."""
+        if not self._available:
+            return ""
+        try:
+            collection = self._get_collection(target)
+            if collection is None:
+                return ""
+
+            meta = self._enrich_fi_write_metadata(content, metadata)
+            meta["target"] = target
+            meta["stored_at"] = time.time()
+            meta.setdefault("importance", 0.5)
+            meta = self._sanitize_metadata(meta)
+
+            doc_id = self._make_id(content, target)
+            self._upsert(collection, ids=[doc_id], documents=[content], metadatas=[meta])
+            logger.debug("Stored memory %s in target=%s", doc_id, target)
+            return doc_id
+        except Exception as e:
+            logger.warning("store_memory failed: %s", e)
+            return ""
+
+    def search_memories(
+        self, query: str, target: str, n_results: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Search memories by semantic similarity."""
+        if not self._available:
+            return []
+        try:
+            collection = self._get_collection(target)
+            if collection is None:
+                return []
+
+            where_filter = {"target": target}
+            query_count = self._atlas_fi_query_count(n_results)
+            results = self._query(collection, query, n_results=query_count, where=where_filter)
+            rows = self._format_results(results)
+            rows = self._atlas_fi_rerank(query, rows)
+            return rows[:n_results]
+        except Exception as e:
+            logger.warning("search_memories failed: %s", e)
+            return []
+
+    def remove_memory(self, memory_id: str, target: str) -> bool:
+        """Remove a memory by ID."""
+        if not self._available:
+            return False
+        try:
+            collection = self._get_collection(target)
+            if collection is None:
+                return False
+            collection.delete(ids=[memory_id])
+            logger.debug("Removed memory %s from target=%s", memory_id, target)
+            return True
+        except Exception as e:
+            logger.warning("remove_memory failed: %s", e)
+            return False
+
+    def get_relevant_memories(
+        self, query: str, target: str, char_budget: int = 2200
+    ) -> str:
+        """Get formatted memory text within char_budget, ranked by composite score."""
+        if not self._available:
+            return ""
+        try:
+            raw = self.search_memories(query, target, n_results=50)
+            if not raw:
+                return ""
+
+            # search_memories already FI-reranks and writes composite_score
+            # when atlas_fi_runtime is enabled. When disabled, rows come back
+            # without composite_score — restore G1A scoring in that case.
+            # Never call _atlas_fi_rerank here (it already ran in search_memories).
+            if self._atlas_fi_enabled() and any("composite_score" in r for r in raw):
+                scored = sorted(raw, key=lambda x: x.get("composite_score", 0), reverse=True)
+            else:
+                scored = self._score_results(raw)
+                scored.sort(key=lambda x: x.get("composite_score", 0), reverse=True)
+
+            entries = []
+            total_chars = 0
+            delimiter = "\n§\n"
+
+            for item in scored:
+                content = item["content"]
+                needed = len(content) + (len(delimiter) if entries else 0)
+                if total_chars + needed > char_budget:
+                    continue
+                entries.append(content)
+                total_chars += needed
+
+            if not entries:
+                return ""
+            return delimiter.join(entries)
+        except Exception as e:
+            logger.warning("get_relevant_memories failed: %s", e)
+            return ""
+
+    # -- Session summaries --------------------------------------------------
+
+    def store_session_summary(
+        self, session_id: str, summary: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Store a session summary."""
+        if not self._available:
+            return ""
+        try:
+            collection = self._collections.get("sessions")
+            if collection is None:
+                return ""
+
+            meta = self._enrich_fi_write_metadata(summary, metadata)
+            meta["session_id"] = session_id
+            meta["stored_at"] = time.time()
+            meta["target"] = "session"
+            meta.setdefault("importance", 0.5)
+            meta = self._sanitize_metadata(meta)
+
+            doc_id = f"session_{session_id}"
+            self._upsert(collection, ids=[doc_id], documents=[summary], metadatas=[meta])
+            logger.debug("Stored session summary %s", doc_id)
+            return doc_id
+        except Exception as e:
+            logger.warning("store_session_summary failed: %s", e)
+            return ""
+
+    def search_sessions(self, query: str, n_results: int = 5) -> List[Dict[str, Any]]:
+        """Search session summaries by semantic similarity."""
+        if not self._available:
+            return []
+        try:
+            collection = self._collections.get("sessions")
+            if collection is None:
+                return []
+            query_count = self._atlas_fi_query_count(n_results)
+            results = self._query(collection, query, n_results=query_count)
+            rows = self._format_results(results)
+            rows = self._atlas_fi_rerank(query, rows)
+            return rows[:n_results]
+        except Exception as e:
+            logger.warning("search_sessions failed: %s", e)
+            return []
+
+    # -- Team knowledge / team ops / agent memory ---------------------------
+
+    def store_team_knowledge(
+        self, content: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Store shared team knowledge."""
+        if not self._available:
+            return ""
+        try:
+            collection = self._collections.get("team_knowledge")
+            if collection is None:
+                return ""
+            meta = self._enrich_fi_write_metadata(content, metadata)
+            meta["collection_type"] = "team_knowledge"
+            meta["stored_at"] = time.time()
+            meta.setdefault("importance", 0.5)
+            meta = self._sanitize_metadata(meta)
+            doc_id = self._make_id(content, "team_knowledge")
+            self._upsert(collection, ids=[doc_id], documents=[content], metadatas=[meta])
+            logger.debug("Stored team_knowledge %s", doc_id)
+            return doc_id
+        except Exception as e:
+            logger.warning("store_team_knowledge failed: %s", e)
+            return ""
+
+    def search_team_knowledge(
+        self, query: str, n_results: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Search shared team knowledge."""
+        if not self._available:
+            return []
+        try:
+            collection = self._collections.get("team_knowledge")
+            if collection is None:
+                return []
+            query_count = self._atlas_fi_query_count(n_results)
+            results = self._query(collection, query, n_results=query_count)
+            rows = self._format_results(results)
+            rows = self._atlas_fi_rerank(query, rows)
+            return rows[:n_results]
+        except Exception as e:
+            logger.warning("search_team_knowledge failed: %s", e)
+            return []
+
+    def store_team_ops(
+        self, content: str, agent_name: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Store team operational state."""
+        if not self._available:
+            return ""
+        try:
+            collection = self._collections.get("team_ops")
+            if collection is None:
+                return ""
+            meta = self._enrich_fi_write_metadata(content, metadata)
+            meta["collection_type"] = "team_ops"
+            meta["agent_name"] = agent_name
+            meta["stored_at"] = time.time()
+            meta.setdefault("importance", 0.5)
+            meta = self._sanitize_metadata(meta)
+            doc_id = self._make_id(content, "team_ops")
+            self._upsert(collection, ids=[doc_id], documents=[content], metadatas=[meta])
+            logger.debug("Stored team_ops %s by agent %s", doc_id, agent_name)
+            return doc_id
+        except Exception as e:
+            logger.warning("store_team_ops failed: %s", e)
+            return ""
+
+    def search_team_ops(
+        self, query: str, agent_name: Optional[str] = None, n_results: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Search team ops, optionally filtered by agent."""
+        if not self._available:
+            return []
+        try:
+            collection = self._collections.get("team_ops")
+            if collection is None:
+                return []
+            where_filter = None
+            if agent_name:
+                where_filter = {"agent_name": agent_name}
+            query_count = self._atlas_fi_query_count(n_results)
+            results = self._query(collection, query, n_results=query_count, where=where_filter)
+            rows = self._format_results(results)
+            rows = self._atlas_fi_rerank(query, rows)
+            return rows[:n_results]
+        except Exception as e:
+            logger.warning("search_team_ops failed: %s", e)
+            return []
+
+    def store_agent_memory(
+        self, content: str, agent_name: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Store memory in an agent-specific collection."""
+        if not self._available:
+            return ""
+        try:
+            col_key = f"agent_{agent_name}"
+            collection = self._collections.get(col_key)
+            if collection is None:
+                return ""
+            meta = self._enrich_fi_write_metadata(content, metadata)
+            meta["collection_type"] = col_key
+            meta["agent_name"] = agent_name
+            meta["stored_at"] = time.time()
+            meta.setdefault("importance", 0.5)
+            meta = self._sanitize_metadata(meta)
+            doc_id = self._make_id(content, col_key)
+            self._upsert(collection, ids=[doc_id], documents=[content], metadatas=[meta])
+            logger.debug("Stored agent memory %s for %s", doc_id, agent_name)
+            return doc_id
+        except Exception as e:
+            logger.warning("store_agent_memory failed for %s: %s", agent_name, e)
+            return ""
+
+    def search_agent_memory(
+        self, query: str, agent_name: str, n_results: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Search an agent-specific memory collection."""
+        if not self._available:
+            return []
+        try:
+            col_key = f"agent_{agent_name}"
+            collection = self._collections.get(col_key)
+            if collection is None:
+                return []
+            query_count = self._atlas_fi_query_count(n_results)
+            results = self._query(collection, query, n_results=query_count)
+            rows = self._format_results(results)
+            rows = self._atlas_fi_rerank(query, rows)
+            return rows[:n_results]
+        except Exception as e:
+            logger.warning("search_agent_memory failed for %s: %s", agent_name, e)
+            return []
+
+    def search_all_accessible(
+        self, query: str, agent_name: str = "rilo", n_results: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Search across all collections an agent can access."""
+        if not self._available:
+            return []
+        try:
+            if agent_name == "rilo":
+                col_keys = [k for k in self._collections if k not in ("memories", "sessions")]
+            else:
+                col_keys = [f"agent_{agent_name}", "team_knowledge", "team_ops"]
+
+            all_results = []
+            for key in col_keys:
+                collection = self._collections.get(key)
+                if collection is None:
+                    continue
+                try:
+                    query_count = self._atlas_fi_query_count(n_results)
+                    raw = self._query(collection, query, n_results=query_count)
+                    formatted = self._format_results(raw)
+                    for r in formatted:
+                        r["source_collection"] = key
+                    all_results.extend(formatted)
+                except Exception:
+                    continue
+
+            all_results.sort(key=lambda x: x.get("distance", 999.0))
+            all_results = self._atlas_fi_rerank(query, all_results)
+            return all_results
+        except Exception as e:
+            logger.warning("search_all_accessible failed: %s", e)
+            return []
+
+    # -- Approach B: Smart memory ranking -----------------------------------
+
+    def rank_and_select_entries(
+        self,
+        entries: List[str],
+        target: str,
+        char_budget: int = 2200,
+        session_context: str = "",
+    ) -> List[str]:
+        """Rank flat-file entries using ChromaDB composite scores and select
+        the best subset that fits within char_budget."""
+        if not entries:
+            return []
+
+        if not self._available:
+            return self._select_within_budget(entries, char_budget)
+
+        try:
+            query = session_context.strip() if session_context.strip() else self._default_context_query(target)
+            raw = self.search_memories(query, target, n_results=50)
+            if not raw:
+                return self._select_within_budget(entries, char_budget)
+
+            scored = self._score_results(raw)
+            score_map: Dict[str, float] = {}
+            for item in scored:
+                content = item.get("content", "")
+                score_map[content] = item["composite_score"]
+
+            scored_entries: List[tuple] = []
+            unscored_entries: List[str] = []
+
+            for entry in entries:
+                if entry in score_map:
+                    scored_entries.append((score_map[entry], entry))
+                else:
+                    unscored_entries.append(entry)
+
+            scored_entries.sort(key=lambda x: x[0], reverse=True)
+            ranked = [entry for _, entry in scored_entries] + unscored_entries
+            return self._select_within_budget(ranked, char_budget)
+
+        except Exception as e:
+            logger.warning("rank_and_select_entries failed: %s — falling back to flat order", e)
+            return self._select_within_budget(entries, char_budget)
+
+    @staticmethod
+    def _select_within_budget(entries: List[str], char_budget: int) -> List[str]:
+        """Select entries from the list that fit within the character budget."""
+        if not entries or char_budget <= 0:
+            return []
+
+        delimiter = "\n§\n"
+        selected: List[str] = []
+        total = 0
+
+        for entry in entries:
+            needed = len(entry) + (len(delimiter) if selected else 0)
+            if total + needed > char_budget:
+                continue
+            selected.append(entry)
+            total += needed
+
+        return selected
+
+    @staticmethod
+    def _default_context_query(target: str) -> str:
+        """Generate a broad default query for ranking when no session context is available."""
+        if target == "user":
+            return "user preferences workflow habits communication style"
+        return "environment tools project conventions workflow patterns"
+
+    # -- Scoring and formatting internals -----------------------------------
+
+    @staticmethod
+    def _format_results(raw_results: Dict) -> List[Dict[str, Any]]:
+        """Convert ChromaDB query results into a flat list of dicts."""
+        results = []
+        if not raw_results or not raw_results.get("ids"):
+            return results
+
+        ids = raw_results["ids"][0] if raw_results["ids"] else []
+        docs = raw_results["documents"][0] if raw_results.get("documents") else []
+        metas = raw_results["metadatas"][0] if raw_results.get("metadatas") else []
+        dists = raw_results["distances"][0] if raw_results.get("distances") else []
+
+        for i, doc_id in enumerate(ids):
+            results.append({
+                "id": doc_id,
+                "content": docs[i] if i < len(docs) else "",
+                "metadata": metas[i] if i < len(metas) else {},
+                "distance": dists[i] if i < len(dists) else 1.0,
+            })
+
+        return results
+
+    def _score_results(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Compute G1A v1 composite scores.
+
+        Formula: 0.35 semantic + 0.25 recency + 0.20 source_quality
+        + 0.15 importance + 0.05 durability. Recency retains the existing
+        30-day linear window in plugins.memory.chromadb.g1a.
+        """
+        from plugins.memory.chromadb.g1a import score_results
+
+        return score_results(results, now=time.time())
+
+    # -- Helpers ------------------------------------------------------------
+
+    def _get_consolidator(self):
+        """Get or create the MemoryConsolidator instance."""
+        if self._consolidator is None:
+            from plugins.memory.chromadb.consolidation import MemoryConsolidator
+            self._consolidator = MemoryConsolidator()
+        return self._consolidator
+
+
+# ---------------------------------------------------------------------------
+# Plugin entry point
+# ---------------------------------------------------------------------------
+
+def register(ctx) -> None:
+    """Register ChromaDB as a memory provider plugin."""
+    ctx.register_memory_provider(ChromaDBMemoryProvider())

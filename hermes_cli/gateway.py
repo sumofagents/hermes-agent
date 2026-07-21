@@ -6688,6 +6688,12 @@ def _gateway_command_inner(args):
         gateway_setup()
         return
 
+    if subcmd in {"validate", "doctor"}:
+        from hermes_cli.gateway_validate import cmd_validate
+
+        cmd_validate(args)
+        return
+
     # Service management commands
     if subcmd == "install":
         if is_managed():

@@ -22,7 +22,6 @@ import os
 import random
 import re
 import ssl
-import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -70,6 +69,7 @@ from agent.retry_utils import (
 )
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_ledger import build_model_call_event, write_usage_span
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
@@ -668,6 +668,7 @@ def run_conversation(
     current_turn_user_idx = _ctx.current_turn_user_idx
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
+    _g2_recall_context = _ctx.g2_recall_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
     # Commentary deduplication spans all provider continuations and tool calls
@@ -879,8 +880,8 @@ def run_conversation(
             _api_content = api_msg.pop("api_content", None)
 
             # Inject ephemeral context into the current turn's user message.
-            # Sources: memory manager prefetch + plugin pre_llm_call hooks
-            # with target="user_message" (the default).  Both are
+            # Sources: G2 enforced recall, external-memory prefetch, and plugin
+            # pre_llm_call hooks with target="user_message" (the default).  All are
             # API-call-time only — the original message in `messages` is
             # never mutated beyond the api_content stamp, so nothing leaks
             # into the clean transcript content.
@@ -901,6 +902,19 @@ def run_conversation(
                     )
                     if _composed is not None:
                         api_msg["content"] = _composed
+                # G2 first-turn recall — ephemeral current-turn injection.
+                # Upstream's compose_user_api_content handles prefetch/plugin
+                # byte-stably; G2 enforced recall is applied here as an
+                # ephemeral injection so it is not dropped, without
+                # re-introducing the prefetch/plugin append (composed above).
+                if _g2_recall_context:
+                    try:
+                        from agent.recall_gate import append_ephemeral_context_to_user_message
+                        api_msg = append_ephemeral_context_to_user_message(api_msg, [_g2_recall_context])
+                    except Exception:
+                        _base = api_msg.get("content", "")
+                        if isinstance(_base, str):
+                            api_msg["content"] = _base + "\n\n" + _g2_recall_context
             elif (
                 isinstance(_api_content, str)
                 and _api_content
@@ -2326,6 +2340,33 @@ def run_conversation(
                             pass
                     agent.session_cost_status = cost_result.status
                     agent.session_cost_source = cost_result.source
+
+                    # Oracle usage ledger: disabled by default, metadata-only.
+                    # This writes append-only spans at the central post-response
+                    # accounting seam so Rilo/Forge reporting can grow without
+                    # provider-adapter instrumentation drift.
+                    try:
+                        write_usage_span(
+                            build_model_call_event(
+                                session_id=agent.session_id,
+                                provider=agent.provider,
+                                model=agent.model,
+                                api_mode=agent.api_mode,
+                                usage=canonical_usage,
+                                cost=cost_result,
+                                status_class="success",
+                                wall_ms=int(api_duration * 1000),
+                                source=agent.platform or "cli",
+                                base_url=agent.base_url,
+                            ),
+                            config=getattr(agent, "_agent_config", None),
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            "Usage ledger span write failed (session=%s): %s",
+                            agent.session_id,
+                            e,
+                        )
 
                     # Persist token counts to session DB for /insights.
                     # Do this for every platform with a session_id so non-CLI

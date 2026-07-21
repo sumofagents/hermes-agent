@@ -411,6 +411,32 @@ Configure the key via `API_SERVER_KEY` env var. If you need a browser to call He
 The API server gives full access to hermes-agent's toolset, **including terminal commands**. `API_SERVER_KEY` is **required for every deployment**, including the default loopback bind on `127.0.0.1`. Keep `API_SERVER_CORS_ORIGINS` narrow to control browser access when you explicitly allow browser callers.
 :::
 
+### Post-restart validation
+
+Use `hermes gateway validate` after starting or restarting a gateway. The command is read-only: it does not restart services, edit `.env`, or write secrets. It checks runtime/service state, `/health`, `/health/detailed`, `/v1/models`, `/v1/capabilities`, recent gateway log warnings/errors, and local git state.
+
+```bash
+hermes gateway validate
+hermes gateway validate --json
+```
+
+If `API_SERVER_KEY` is set in Hermes' environment or `~/.hermes/.env`, validation sends `Authorization: Bearer ...` to authenticated endpoints without printing the token. To prove auth is actually enforced, use `--expect-auth`:
+
+```bash
+hermes gateway validate --expect-auth --api-key-env API_SERVER_KEY --json
+```
+
+With `--expect-auth`, `/v1/models` must return `401` without a token and `200` with the token. `/health` and `/health/detailed` intentionally remain unauthenticated.
+
+Optional checks:
+
+```bash
+hermes gateway validate --probe-memory   # include Chroma/Forge readiness probes
+hermes gateway validate --chat-smoke     # run a tiny /v1/chat/completions smoke test
+```
+
+For local API lock-down, keep the secret rollout out of git: generate a bearer token locally, write `API_SERVER_KEY` to the Hermes profile `.env`, write the matching frontend token to that frontend's own env file, restart the gateway, then run `hermes gateway validate --expect-auth --api-key-env API_SERVER_KEY --json`. The validator redacts bearer tokens in JSON and text output.
+
 ## Configuration
 
 ### Environment Variables

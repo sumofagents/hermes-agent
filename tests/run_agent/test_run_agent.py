@@ -4189,6 +4189,100 @@ class TestRunConversation:
         agent.compression_enabled = False
         agent.save_trajectories = False
 
+    def test_g2_recall_injects_first_api_call_without_persisting_raw_message(self, agent):
+        self._setup_agent(agent)
+        prompt = "help me fill this Anduril application using what you know from SpaceX"
+        recall_block = "## Enforced Memory Recall\nSources:\n- [m1] score=0.900 source=builtin_mirror target=user durability=durable\n  durable SpaceX application fact"
+
+        class FakeMemoryManager:
+            def __init__(self):
+                self.enforced_calls = []
+
+            def on_turn_start(self, *args, **kwargs):
+                pass
+
+            def enforced_recall(self, query, *, first_turn, session_id=""):
+                self.enforced_calls.append((query, first_turn, session_id))
+                return recall_block
+
+            def prefetch_all(self, query, *, session_id=""):
+                return ""
+
+            def sync_all(self, *args, **kwargs):
+                pass
+
+            def queue_prefetch_all(self, *args, **kwargs):
+                pass
+
+        fake_memory = FakeMemoryManager()
+        agent._memory_manager = fake_memory
+        agent._first_turn_recall_enabled = True
+        agent.client.chat.completions.create.return_value = _mock_response(content="Final answer", finish_reason="stop")
+
+        with (
+            patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+            patch.object(agent, "_persist_session") as mock_persist,
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(prompt)
+
+        assert result["final_response"] == "Final answer"
+        sent_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        sent_user = next(m for m in sent_messages if m.get("role") == "user")
+        assert prompt in sent_user["content"]
+        assert "## Enforced Memory Recall" in sent_user["content"]
+        assert "durable SpaceX application fact" in sent_user["content"]
+        assert fake_memory.enforced_calls == [(prompt, True, agent.session_id)]
+
+        persisted_messages = mock_persist.call_args.args[0]
+        persisted_user = next(m for m in persisted_messages if m.get("role") == "user")
+        assert persisted_user["content"] == prompt
+        returned_user = next(m for m in result["messages"] if m.get("role") == "user")
+        assert returned_user["content"] == prompt
+        assert "## Enforced Memory Recall" not in persisted_user["content"]
+
+    def test_g2_kill_switch_preserves_api_payload_and_emits_no_recall_events(self, agent):
+        self._setup_agent(agent)
+        prompt = "help me fill this Anduril application using what you know from SpaceX"
+
+        class FakeMemoryManager:
+            def on_turn_start(self, *args, **kwargs):
+                pass
+
+            def enforced_recall(self, *args, **kwargs):  # pragma: no cover - must not run
+                raise AssertionError("G2 enforced_recall should be disabled")
+
+            def prefetch_all(self, query, *, session_id=""):
+                return ""
+
+            def sync_all(self, *args, **kwargs):
+                pass
+
+            def queue_prefetch_all(self, *args, **kwargs):
+                pass
+
+        agent._memory_manager = FakeMemoryManager()
+        agent._first_turn_recall_enabled = False
+        agent.client.chat.completions.create.return_value = _mock_response(content="Final answer", finish_reason="stop")
+
+        with (
+            patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+            patch("plugins.memory.chromadb.g1b_observability.append_feedback_event") as mock_feedback,
+            patch.object(agent, "_persist_session") as mock_persist,
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(prompt)
+
+        assert result["final_response"] == "Final answer"
+        sent_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        sent_user = next(m for m in sent_messages if m.get("role") == "user")
+        assert sent_user["content"] == prompt
+        mock_feedback.assert_not_called()
+        persisted_user = next(m for m in mock_persist.call_args.args[0] if m.get("role") == "user")
+        assert persisted_user["content"] == prompt
+
     def test_stop_finish_reason_returns_response(self, agent):
         self._setup_agent(agent)
         resp = _mock_response(content="Final answer", finish_reason="stop")

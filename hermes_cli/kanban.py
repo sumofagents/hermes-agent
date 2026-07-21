@@ -80,6 +80,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "metadata": t.metadata or {},
     }
 
 
@@ -366,6 +367,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
+    p_create.add_argument("--metadata", default=None,
+                          help="JSON object for task-level policy metadata. "
+                               "Use significant_work/guardrail_group/guardrail_role "
+                               "to activate hard C/D/E gate enforcement.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -1342,6 +1347,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
         print(f"kanban: --max-runtime: {exc}", file=sys.stderr)
         return 2
     max_retries = getattr(args, "max_retries", None)
+    metadata = None
+    if getattr(args, "metadata", None):
+        try:
+            metadata = json.loads(args.metadata)
+        except json.JSONDecodeError as exc:
+            print(f"kanban: --metadata must be valid JSON: {exc}", file=sys.stderr)
+            return 2
+        if not isinstance(metadata, dict):
+            print("kanban: --metadata must decode to a JSON object", file=sys.stderr)
+            return 2
     if max_retries is not None and max_retries < 1:
         print(
             f"kanban: --max-retries must be >= 1 (got {max_retries}); "
@@ -1371,6 +1386,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            metadata=metadata,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):

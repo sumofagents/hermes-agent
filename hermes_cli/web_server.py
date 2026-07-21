@@ -272,13 +272,19 @@ app.include_router(_memory_oauth_router)
 
 # ---------------------------------------------------------------------------
 # Session token for protecting sensitive endpoints (reveal).
-# The desktop shell mints the token and injects it via
-# HERMES_DASHBOARD_SESSION_TOKEN so its main process can authenticate the
-# /api calls it makes on the user's behalf; otherwise we generate one fresh
-# on every server start. Either way it dies when the process exits and is
-# injected into the SPA HTML so only the legitimate web UI can use it.
+# Generated fresh on every server start — dies when the process exits.
+# Injected into the SPA HTML so only the legitimate web UI can use it.
+#
+# Hermes Desktop starts the local dashboard backend itself and passes the token
+# it will hand to the renderer through HERMES_DASHBOARD_SESSION_TOKEN.  Browser
+# dashboard launches do not set it, so they keep the random per-process token.
 # ---------------------------------------------------------------------------
-_SESSION_TOKEN = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or secrets.token_urlsafe(32)
+def _load_session_token() -> str:
+    configured = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN", "").strip()
+    return configured or secrets.token_urlsafe(32)
+
+
+_SESSION_TOKEN = _load_session_token()
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 
 # In-browser Chat tab (/chat, /api/pty, /api/ws, …).  Always enabled: the

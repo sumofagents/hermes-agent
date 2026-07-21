@@ -159,6 +159,71 @@ def build_gateway_parser(
     )
     _add_compat_platform_flag(gateway_status)
 
+    # gateway validate / doctor
+    def _add_gateway_validate_args(parser):
+        parser.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+        parser.add_argument(
+            "--probe-memory",
+            action="store_true",
+            help="Include network memory readiness probes for Chroma/Forge",
+        )
+        parser.add_argument(
+            "--chat-smoke",
+            action="store_true",
+            help="Run an exact-answer /v1/chat/completions smoke test",
+        )
+        parser.add_argument(
+            "--api-key-env",
+            default="API_SERVER_KEY",
+            help="Hermes env/.env variable containing the API bearer token",
+        )
+        parser.add_argument(
+            "--expect-auth",
+            action="store_true",
+            help="Require /v1/models to reject unauthenticated requests with 401",
+        )
+        parser.add_argument(
+            "--log-bytes",
+            type=int,
+            default=4096,
+            help="Bytes of ~/.hermes/logs/gateway.log to scan from the end",
+        )
+        parser.add_argument(
+            "--log-offset",
+            type=int,
+            default=None,
+            help="Byte offset in gateway.log to scan from instead of tailing",
+        )
+        parser.add_argument(
+            "--timeout",
+            type=float,
+            default=2.0,
+            help="HTTP timeout per probe in seconds",
+        )
+        parser.add_argument(
+            "--base-url",
+            default=None,
+            help=(
+                "Gateway API base URL (default: API_SERVER_HOST/API_SERVER_PORT "
+                "or http://127.0.0.1:8642)"
+            ),
+        )
+
+    gateway_validate = gateway_subparsers.add_parser(
+        "validate",
+        help="Run read-only post-restart gateway validation checks",
+        description=(
+            "Validate gateway health, API auth, logs, memory readiness, and git "
+            "state without restarting services."
+        ),
+    )
+    _add_gateway_validate_args(gateway_validate)
+    gateway_doctor = gateway_subparsers.add_parser(
+        "doctor",
+        help="Alias for gateway validate",
+    )
+    _add_gateway_validate_args(gateway_doctor)
+
     # gateway install
     gateway_install = gateway_subparsers.add_parser(
         "install", help="Install gateway as a systemd/launchd background service"

@@ -388,6 +388,7 @@ class MemoryManager:
             "abandoned_prefetches": 0,
             "active_tasks": 0,
         }
+        self._system_prompt_pair_cache: Optional[tuple[str, str]] = None
 
     # -- Registration --------------------------------------------------------
 
@@ -479,18 +480,103 @@ class MemoryManager:
         Returns combined text, or empty string if no providers contribute.
         Each non-empty block is labeled with the provider name.
         """
+        if self._system_prompt_pair_cache is not None:
+            block, _profile = self._system_prompt_pair_cache
+            self._system_prompt_pair_cache = None
+            return block
+        block, _profile = self._compute_system_prompt_with_memory_profile()
+        return block
+
+    def build_system_prompt_with_memory_profile(
+        self, *, cache_for_render: bool = False) -> tuple[str, str]:
+        """Collect rendered provider prompt plus trusted external profile block.
+
+        The returned profile block is the provider-owned generated profile that
+        is part of the rendered external provider prompt.  This prevents prompt
+        policy from suppressing legacy MEMORY/USER from one generated-profile
+        call while rendering a different/empty provider block from another.
+        """
+        pair = self._compute_system_prompt_with_memory_profile()
+        self._system_prompt_pair_cache = pair if cache_for_render else None
+        return pair
+
+    def _compute_system_prompt_with_memory_profile(self) -> tuple[str, str]:
         blocks = []
+        external_profile_block = ""
         for provider in self._providers:
             try:
-                block = provider.system_prompt_block()
+                block, profile_block = provider.system_prompt_block_with_memory_profile()
+                block = block if isinstance(block, str) else ""
+                profile_block = profile_block if isinstance(profile_block, str) else ""
                 if block and block.strip():
                     blocks.append(block)
+                if provider.name != "builtin" and not external_profile_block:
+                    # Only trust the narrow profile signal when it is actually
+                    # rendered in the provider block assembled for this prompt.
+                    if (
+                        block
+                        and profile_block
+                        and profile_block.strip()
+                        and profile_block.strip() in block
+                    ):
+                        external_profile_block = profile_block
+            except Exception as e:
+                logger.warning(
+                    "Memory provider '%s' system_prompt_block_with_memory_profile() failed: %s",
+                    provider.name, e,
+                )
+        return "\n\n".join(blocks), external_profile_block
+
+    def external_system_prompt_block(self) -> str:
+        """Return the system prompt block from the single external provider.
+
+        Core prompt-source policy calls this when it needs to decide whether
+        to suppress legacy MEMORY/USER markdown blocks. Only the non-builtin
+        provider contributes; builtin status text remains additive in legacy
+        modes. Provider errors are logged and converted to an empty string so
+        callers can fall back to legacy memory.
+        """
+        for provider in self._providers:
+            if provider.name == "builtin":
+                continue
+            try:
+                block = provider.system_prompt_block()
             except Exception as e:
                 logger.warning(
                     "Memory provider '%s' system_prompt_block() failed: %s",
                     provider.name, e,
                 )
-        return "\n\n".join(blocks)
+                return ""
+            if block and block.strip():
+                return block
+            return ""
+        return ""
+
+    def external_memory_profile_block(self) -> str:
+        """Return the external provider's trusted memory/profile block.
+
+        This is intentionally narrower than ``external_system_prompt_block()``:
+        prompt-source replacement decisions should be based on provider-owned
+        generated profile output, not status prose or untrusted recalled/team
+        context that may also be rendered in the provider's system prompt.
+        Providers that do not override ``memory_profile_prompt_block()`` keep
+        the historical behavior via the base-class default.
+        """
+        for provider in self._providers:
+            if provider.name == "builtin":
+                continue
+            try:
+                block = provider.memory_profile_prompt_block()
+            except Exception as e:
+                logger.warning(
+                    "Memory provider '%s' memory_profile_prompt_block() failed: %s",
+                    provider.name, e,
+                )
+                return ""
+            if block and block.strip():
+                return block
+            return ""
+        return ""
 
     # -- Prefetch / recall ---------------------------------------------------
 
@@ -583,6 +669,25 @@ class MemoryManager:
         if error_box:
             raise error_box["value"]
         return result_box.get("value", "")
+
+    def enforced_recall(self, query: str, *, first_turn: bool, session_id: str = "") -> str:
+        """Collect synchronous current-turn recall context from providers.
+
+        This is opt-in for providers and failure-isolated like prefetch_all().
+        It is only called by core when the G2 kill switch is enabled.
+        """
+        parts = []
+        for provider in self._providers:
+            try:
+                result = provider.enforced_recall(query, first_turn=first_turn, session_id=session_id)
+                if result and result.strip():
+                    parts.append(result)
+            except Exception as e:
+                logger.debug(
+                    "Memory provider '%s' enforced_recall failed (non-fatal): %s",
+                    provider.name, e,
+                )
+        return "\n\n".join(parts)
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn.

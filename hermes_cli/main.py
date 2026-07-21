@@ -4449,6 +4449,13 @@ def cmd_status(args):
     show_status(args)
 
 
+def cmd_usage(args):
+    """Inspect local usage ledger spans."""
+    from hermes_cli.usage import usage_command
+
+    sys.exit(usage_command(args))
+
+
 def cmd_cron(args):
     """Cron job management."""
     from hermes_cli.cron import cron_command
@@ -12855,7 +12862,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "project", "proxy",
         "prompt-size",
         "send", "sessions", "setup",
-        "skills", "slack", "status", "tools", "uninstall", "update",
+        "skills", "slack", "status", "tools", "uninstall", "update", "usage",
         "version", "webhook", "whatsapp", "whatsapp-cloud", "chat", "secrets", "security",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
@@ -13407,6 +13414,14 @@ def main():
     moa_delete = moa_subparsers.add_parser("delete", aliases=["rm"], help="Delete a MoA preset")
     moa_delete.add_argument("name", help="Preset name to delete")
     moa_parser.set_defaults(func=cmd_moa)
+
+    # =========================================================================
+    # usage command — local metadata-only usage ledger reader
+    # =========================================================================
+    from hermes_cli.usage import register_usage_parser
+
+    usage_parser = register_usage_parser(subparsers)
+    usage_parser.set_defaults(func=cmd_usage, usage_command="summary")
 
     # =========================================================================
     # fallback command — manage the fallback provider chain

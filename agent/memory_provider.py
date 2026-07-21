@@ -91,6 +91,32 @@ class MemoryProvider(ABC):
         """
         return ""
 
+    def memory_profile_prompt_block(self) -> str:
+        """Return the trusted generated memory/profile block for replacement policy.
+
+        Core prompt-source policy uses this narrower hook to decide whether an
+        external provider can replace legacy MEMORY.md/USER.md blocks. Providers
+        that mix trusted generated profile output with untrusted/status/team
+        prose in ``system_prompt_block()`` should override this and return only
+        the provider-owned generated profile wrapper. The default preserves
+        compatibility for simple providers whose whole system prompt block is
+        their memory/profile block.
+        """
+        return self.system_prompt_block()
+
+    def system_prompt_block_with_memory_profile(self) -> tuple[str, str]:
+        """Return rendered prompt text and the trusted profile block it contains.
+
+        Prompt-source replacement must use the same provider-owned generated
+        profile block that is actually rendered into the prompt.  Providers with
+        non-pure profile builders should override this to compute the generated
+        profile once and return ``(rendered_system_block, generated_profile)``.
+        """
+        block = self.system_prompt_block()
+        if type(self).memory_profile_prompt_block is MemoryProvider.memory_profile_prompt_block:
+            return block, block
+        return block, self.memory_profile_prompt_block()
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Recall relevant context for the upcoming turn.
 
@@ -102,6 +128,16 @@ class MemoryProvider(ABC):
         session_id is provided for providers serving concurrent sessions
         (gateway group chats, cached agents). Providers that don't need
         per-session scoping can ignore it.
+        """
+        return ""
+
+    def enforced_recall(self, query: str, *, first_turn: bool, session_id: str = "") -> str:
+        """Synchronously recall context for high-risk current turns.
+
+        Goal 2 providers override this optional hook. The default is a no-op so
+        all existing providers preserve pre-G2 behavior unless explicitly wired.
+        Returned text is injected into the current user message by core and must
+        not be persisted as raw user text.
         """
         return ""
 

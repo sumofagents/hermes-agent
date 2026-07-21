@@ -238,6 +238,22 @@ class TestSessionTokenInjection:
 # ---------------------------------------------------------------------------
 
 
+class TestDashboardSessionToken:
+    def test_load_session_token_honors_desktop_env(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "desktop-token-123")
+        assert web_server._load_session_token() == "desktop-token-123"
+
+    def test_load_session_token_generates_for_browser_dashboard(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN", raising=False)
+        token = web_server._load_session_token()
+        assert isinstance(token, str)
+        assert len(token) >= 32
+
+
 class TestWebServerEndpoints:
     """Test the FastAPI REST endpoints using Starlette TestClient."""
 
@@ -4919,6 +4935,24 @@ class TestNewEndpoints:
         assert "file" in data
         assert "lines" in data
         assert isinstance(data["lines"], list)
+
+    def test_get_logs_accepts_desktop_gui_files(self):
+        from hermes_constants import get_hermes_home
+
+        logs_dir = get_hermes_home() / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        (logs_dir / "gui.log").write_text("gui line\n", encoding="utf-8")
+        (logs_dir / "desktop.log").write_text("desktop line\n", encoding="utf-8")
+
+        gui_resp = self.client.get("/api/logs?file=gui&lines=10")
+        assert gui_resp.status_code == 200
+        assert gui_resp.json()["file"] == "gui"
+        assert any("gui line" in line for line in gui_resp.json()["lines"])
+
+        desktop_resp = self.client.get("/api/logs?file=desktop&lines=10")
+        assert desktop_resp.status_code == 200
+        assert desktop_resp.json()["file"] == "desktop"
+        assert any("desktop line" in line for line in desktop_resp.json()["lines"])
 
     def test_get_logs_invalid_file(self):
         resp = self.client.get("/api/logs?file=nonexistent")

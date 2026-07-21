@@ -398,6 +398,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "result": t.result,
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
+                    "metadata": t.metadata or {},
                 }
 
             def _run_dict(r):
@@ -1104,6 +1105,11 @@ def _handle_create(args: dict, **kw) -> str:
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
+    metadata = args.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return tool_error(
+            f"metadata must be a JSON object, got {type(metadata).__name__}"
+        )
     skills = args.get("skills")
     if isinstance(skills, str):
         # Accept a single skill name as a string for convenience.
@@ -1162,6 +1168,7 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
+                metadata=metadata,
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
@@ -1869,6 +1876,15 @@ KANBAN_CREATE_SCHEMA = {
                     "continuation turns the worker may take before the task "
                     "is blocked for review. Ignored unless goal_mode is "
                     "true. Defaults to the goal-engine default (20)."
+                ),
+            },
+            "metadata": {
+                "type": "object",
+                "description": (
+                    "Task-level policy metadata. For significant work use "
+                    "significant_work, guardrail_group, guardrail_role "
+                    "(codex_lane, claude_lane, reconciler), or "
+                    "single_controller_acceptable for mechanical waivers."
                 ),
             },
             "board": _board_schema_prop(),

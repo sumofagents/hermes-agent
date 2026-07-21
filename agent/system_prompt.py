@@ -24,7 +24,9 @@ Pure helpers that read the agent's state.  AIAgent keeps thin forwarders.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
@@ -48,6 +50,151 @@ from agent.prompt_builder import (
 from agent.runtime_cwd import resolve_context_cwd
 from hermes_constants import get_hermes_home
 from utils import is_truthy_value
+
+
+logger = logging.getLogger(__name__)
+
+_PROVIDER_UNAVAILABLE_MARKER = "# Memory Provider Unavailable — no profile loaded this session"
+_MEMORY_PROFILE_OPEN_RE = re.compile(
+    r"^[ \t]*(<memory-profile\b[^>]*>)[ \t]*$", re.IGNORECASE | re.MULTILINE
+)
+_MEMORY_PROFILE_CLOSE_RE = re.compile(
+    r"^[ \t]*</memory-profile>[ \t]*$", re.IGNORECASE | re.MULTILINE
+)
+_DEGRADED_FALSE_RE = re.compile(r"\bdegraded\s*=\s*['\"]false['\"]", re.IGNORECASE)
+_DEGRADED_TRUE_RE = re.compile(r"\bdegraded\s*=\s*['\"]true['\"]", re.IGNORECASE)
+
+
+def _external_memory_prompt_block(agent: Any) -> str:
+    """Return provider-owned memory/profile text used for prompt-source policy."""
+    manager = getattr(agent, "_memory_manager", None)
+    if manager is None:
+        return ""
+
+    # Prefer the same-build pair hook. When this legacy helper is called
+    # directly (outside ``build_system_prompt_parts``), cache the rendered
+    # provider prompt for the next ``build_system_prompt()`` call so policy and
+    # render still use one generated-profile result.
+    paired_block = getattr(manager, "build_system_prompt_with_memory_profile", None)
+    if callable(paired_block):
+        try:
+            pair = paired_block(cache_for_render=True)
+            if isinstance(pair, tuple) and len(pair) == 2 and isinstance(pair[1], str):
+                return pair[1]
+        except Exception as exc:
+            logger.warning("External memory provider paired prompt block failed: %s", exc)
+            return ""
+
+    # Prefer the narrow replacement-policy hook. Some providers render status
+    # and untrusted recalled/team context alongside their generated profile in
+    # ``system_prompt_block()``; replacement decisions must not parse that
+    # whole opaque prompt as if every line were provider-owned profile output.
+    profile_block = getattr(manager, "external_memory_profile_block", None)
+    if callable(profile_block):
+        try:
+            block = profile_block()
+            return block if isinstance(block, str) else ""
+        except Exception as exc:
+            logger.warning("External memory provider profile block failed: %s", exc)
+            return ""
+
+    external_block = getattr(manager, "external_system_prompt_block", None)
+    if callable(external_block):
+        try:
+            block = external_block()
+            return block if isinstance(block, str) else ""
+        except Exception as exc:
+            logger.warning("External memory provider prompt block failed: %s", exc)
+            return ""
+    try:
+        block = manager.build_system_prompt()
+        return block if isinstance(block, str) else ""
+    except Exception as exc:
+        logger.warning("Memory provider prompt block failed: %s", exc)
+        return ""
+
+
+def _extract_final_memory_profile(block: str) -> Optional[tuple[str, str]]:
+    """Return ``(opening_tag, body)`` for a complete final profile block.
+
+    Providers may prepend status/provenance/team-memory prose before their
+    generated profile.  Only a top-level ``<memory-profile>`` line that has a
+    matching closing line and is the final substantive block is eligible;
+    inline mentions or incomplete tags in arbitrary prose remain additive and
+    must not suppress legacy MEMORY/USER.md.
+    """
+    if not block or not block.strip():
+        return None
+
+    # Prefer the last complete top-level profile block.  Generated Chroma
+    # profiles are appended after provider status/team context; requiring the
+    # closing tag to be at the tail prevents earlier prose mentions from
+    # spoofing replacement readiness.
+    for open_match in reversed(list(_MEMORY_PROFILE_OPEN_RE.finditer(block))):
+        tail = block[open_match.end():]
+        close_match = _MEMORY_PROFILE_CLOSE_RE.search(tail)
+        if not close_match:
+            continue
+        if tail[close_match.end():].strip():
+            continue
+        body = tail[:close_match.start()]
+        if not body.strip():
+            continue
+        if _MEMORY_PROFILE_OPEN_RE.search(body):
+            continue
+        return open_match.group(1), body
+    return None
+
+
+def _is_non_degraded_memory_profile(block: str) -> bool:
+    """Return True only for a complete non-degraded generated profile block.
+
+    Status text or team-memory prose that merely mentions ``<memory-profile>``
+    must not suppress legacy MEMORY/USER.md.  Generated profile blocks may be
+    preceded by provider-owned status/team context, but the profile wrapper
+    itself must be a complete top-level final block and explicitly carry
+    ``degraded=\"false\"``; degraded or malformed blocks remain additive so
+    legacy flat-file memory can act as fallback.
+    """
+    profile = _extract_final_memory_profile(block)
+    if profile is None:
+        return False
+    opening_tag, _body = profile
+    if _DEGRADED_TRUE_RE.search(opening_tag):
+        return False
+    return bool(_DEGRADED_FALSE_RE.search(opening_tag))
+
+
+def _memory_prompt_policy(agent: Any, external_block: Optional[str] = None) -> tuple[bool, str]:
+    """Return ``(suppress_legacy_flat_files, marker_to_insert)``.
+
+    This policy is intentionally provider-agnostic: core only sees opaque
+    provider text and the generated-profile wrapper contract.
+    """
+    prompt_source = (getattr(agent, "_memory_prompt_source", "legacy") or "legacy").strip()
+    if external_block is None:
+        external_block = _external_memory_prompt_block(agent)
+    external_non_degraded = _is_non_degraded_memory_profile(external_block)
+
+    if prompt_source == "provider":
+        if external_non_degraded:
+            return True, ""
+        if external_block and external_block.strip():
+            # Degraded/status provider output is additive; keep legacy fallback.
+            return False, ""
+        logger.warning(_PROVIDER_UNAVAILABLE_MARKER)
+        return True, _PROVIDER_UNAVAILABLE_MARKER
+
+    if prompt_source == "provider_with_legacy_fallback":
+        return external_non_degraded, ""
+
+    if prompt_source == "legacy" and bool(
+        getattr(agent, "_memory_suppress_builtin_when_external", False)
+    ):
+        return external_non_degraded, ""
+
+    # legacy/shadow/unknown keep legacy flat-file memory additive.
+    return False, ""
 
 
 def _ra():
@@ -480,25 +627,46 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # ── Volatile tier (changes per session/turn — never cached) ───
     volatile_parts: List[str] = []
 
-    if agent._memory_store:
+    _ext_mem_block = ""
+    _ext_profile_block = ""
+    if agent._memory_manager:
+        try:
+            _build_with_profile = getattr(
+                agent._memory_manager, "build_system_prompt_with_memory_profile", None)
+            if callable(_build_with_profile):
+                _pair = _build_with_profile()
+                if isinstance(_pair, tuple) and len(_pair) == 2:
+                    _ext_mem_block = _pair[0] if isinstance(_pair[0], str) else ""
+                    _ext_profile_block = _pair[1] if isinstance(_pair[1], str) else ""
+            else:
+                _ext_mem_block = agent._memory_manager.build_system_prompt()
+                _ext_profile_block = _external_memory_prompt_block(agent)
+        except Exception:
+            _ext_mem_block = ""
+            _ext_profile_block = ""
+
+    suppress_legacy_memory, memory_provider_marker = _memory_prompt_policy(
+        agent, external_block=_ext_profile_block)
+
+    if memory_provider_marker:
+        volatile_parts.append(memory_provider_marker)
+
+    if agent._memory_store and not suppress_legacy_memory:
         if agent._memory_enabled:
             mem_block = agent._memory_store.format_for_system_prompt("memory")
             if mem_block:
                 volatile_parts.append(mem_block)
-        # USER.md is always included when enabled.
+        # USER.md is always included when enabled unless provider policy
+        # deliberately suppresses legacy flat-file memory/profile blocks.
         if agent._user_profile_enabled:
             user_block = agent._memory_store.format_for_system_prompt("user")
             if user_block:
                 volatile_parts.append(user_block)
 
-    # External memory provider system prompt block (additive to built-in)
-    if agent._memory_manager:
-        try:
-            _ext_mem_block = agent._memory_manager.build_system_prompt()
-            if _ext_mem_block:
-                volatile_parts.append(_ext_mem_block)
-        except Exception:
-            pass
+    # External memory provider system prompt block (additive unless provider
+    # policy used it to replace legacy flat-file memory/profile blocks).
+    if _ext_mem_block:
+        volatile_parts.append(_ext_mem_block)
 
     from hermes_time import now as _hermes_now
     now = _hermes_now()

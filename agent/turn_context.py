@@ -261,6 +261,8 @@ class TurnContext:
     should_review_memory: bool = False
     # Context contributed by ``pre_llm_call`` plugins (appended to user message).
     plugin_user_context: str = ""
+    # G2 enforced first-turn/current-turn recall context (API-call-time only).
+    g2_recall_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
     ext_prefetch_cache: str = ""
 
@@ -792,6 +794,79 @@ def build_turn_context(
         except Exception:
             pass
 
+    # G2 enforced recall: for high-risk current turns, synchronously search
+    # memory before the first LLM call and inject the result into the
+    # current user message only. Disabled path short-circuits before any
+    # classification, manager call, or recall_* ledger write.
+    g2_recall_context = ""
+    if getattr(agent, "_first_turn_recall_enabled", False):
+        _g2_query = original_user_message if isinstance(original_user_message, str) else ""
+        if agent._memory_manager:
+            try:
+                g2_recall_context = agent._memory_manager.enforced_recall(
+                    _g2_query,
+                    first_turn=(agent._user_turn_count == 1),
+                    session_id=agent.session_id,
+                ) or ""
+            except Exception:
+                g2_recall_context = ""
+        if not g2_recall_context:
+            try:
+                from agent.recall_gate import classify_risk, render_degraded_notice
+
+                _risk = classify_risk(_g2_query)
+                if _risk.mandatory:
+                    try:
+                        import hashlib
+
+                        from hermes_constants import get_hermes_home
+                        from plugins.memory.chromadb.g1b_observability import (
+                            append_feedback_event,
+                            feedback_path_for_home,
+                        )
+
+                        _ctx_sha = hashlib.sha256(
+                            (_g2_query or "").encode("utf-8")
+                        ).hexdigest()
+                        _fb_path = feedback_path_for_home(get_hermes_home())
+                        _risk_class = "+".join(
+                            getattr(_risk, "risk_classes", ()) or ("mandatory_recall",)
+                        )
+                        append_feedback_event(
+                            _fb_path,
+                            event_type="recall_needed",
+                            session_id=agent.session_id,
+                            platform=getattr(agent, "platform", None) or "cli",
+                            gateway_session_key=getattr(agent, "_gateway_session_key", None),
+                            labels=list(getattr(_risk, "labels", ()) or []),
+                            context_sha256=_ctx_sha,
+                            first_turn=(agent._user_turn_count == 1),
+                            mandatory=True,
+                            risk_class=_risk_class,
+                            query_count=0,
+                            collections_searched=[],
+                            latency_ms=0,
+                        )
+                        append_feedback_event(
+                            _fb_path,
+                            event_type="recall_skipped",
+                            session_id=agent.session_id,
+                            platform=getattr(agent, "platform", None) or "cli",
+                            gateway_session_key=getattr(agent, "_gateway_session_key", None),
+                            labels=list(getattr(_risk, "labels", ()) or []),
+                            context_sha256=_ctx_sha,
+                            first_turn=(agent._user_turn_count == 1),
+                            mandatory=True,
+                            risk_class=_risk_class,
+                            skip_reason="no_provider_or_provider_empty",
+                            latency_ms=0,
+                        )
+                    except Exception:
+                        pass
+                    g2_recall_context = render_degraded_notice(_risk)
+            except Exception:
+                g2_recall_context = ""
+
     # External memory provider: prefetch once before the tool loop.
     ext_prefetch_cache = ""
     if agent._memory_manager:
@@ -898,5 +973,6 @@ def build_turn_context(
         current_turn_user_idx=current_turn_user_idx,
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,
+        g2_recall_context=g2_recall_context,
         ext_prefetch_cache=ext_prefetch_cache,
     )
