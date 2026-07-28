@@ -34,7 +34,13 @@ def test_run_agent_wires_first_turn_recall_before_prefetch_and_injects_ephemeral
     idx_prefetch = TURN_CONTEXT.index(".prefetch_all(")
     idx_unpack = CONVERSATION_LOOP.index("_g2_recall_context = _ctx.g2_recall_context")
     idx_inject = CONVERSATION_LOOP.index("if _g2_recall_context:")
-    idx_helper = CONVERSATION_LOOP.index("append_ephemeral_context_to_user_message(api_msg, _injections)")
+    # HEAD (post v2026.7.20 upgrade) injects the single recall context directly
+    # via [_g2_recall_context] rather than the older _injections list. Both forms
+    # preserve the ephemeral-injection invariant; the call signature changed when
+    # the byte-stable compose_user_api_content path landed upstream.
+    idx_helper = CONVERSATION_LOOP.index(
+        "append_ephemeral_context_to_user_message(api_msg, [_g2_recall_context])"
+    )
 
     assert idx_on_turn < idx_g2 < idx_prefetch
     assert idx_unpack < idx_inject < idx_helper

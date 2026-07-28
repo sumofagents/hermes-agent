@@ -946,6 +946,8 @@ def _run_claude_code_task(
             "duration_seconds": duration,
             "backend": "claude-code-cli",
         }
+
+
 def _blocked_toolsets_for_role(role: str) -> List[str]:
     """Return one-tool deny toolsets for a delegated child role.
 
