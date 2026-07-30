@@ -422,6 +422,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_swarm.add_argument("--verifier", required=True, help="Verifier profile")
     p_swarm.add_argument("--synthesizer", required=True, help="Synthesizer/writer profile")
+    p_swarm.add_argument(
+        "--verifier-skills",
+        default=None,
+        help="Comma-separated skills for the verifier card (default: none)",
+    )
+    p_swarm.add_argument(
+        "--synthesizer-skills",
+        default=None,
+        help="Comma-separated skills for the synthesizer card (default: none)",
+    )
     p_swarm.add_argument("--tenant", default=None, help="Tenant namespace")
     p_swarm.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_swarm.add_argument("--created-by", default=None, help="Creator/anchor profile")
@@ -1567,12 +1577,20 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
         print("kanban swarm: at least one --worker is required", file=sys.stderr)
         return 2
     with kb.connect_closing() as conn:
+        verifier_skills = None
+        if getattr(args, "verifier_skills", None):
+            verifier_skills = [s.strip() for s in args.verifier_skills.split(",") if s.strip()]
+        synthesizer_skills = None
+        if getattr(args, "synthesizer_skills", None):
+            synthesizer_skills = [s.strip() for s in args.synthesizer_skills.split(",") if s.strip()]
         created = ks.create_swarm(
             conn,
             goal=args.goal,
             workers=workers,
             verifier_assignee=args.verifier,
             synthesizer_assignee=args.synthesizer,
+            verifier_skills=verifier_skills,
+            synthesizer_skills=synthesizer_skills,
             tenant=args.tenant,
             created_by=args.created_by or _profile_author(),
             priority=args.priority,
