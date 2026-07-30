@@ -263,6 +263,11 @@ _CONFIG_LOCK = threading.RLock()
 _EXTRA_ENV_KEYS = frozenset({
     "OPENAI_API_KEY", "OPENAI_BASE_URL",
     "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN",
+    # User-defined providers under providers.<slug>.key_env (e.g. Cheapest
+    # Inference) store credentials only in .env. Keep them known to reload_env
+    # removal/compat paths so Desktop/gateway /reload does not drop them.
+    "CHEAPESTINFERENCE_API_KEY",
+    "FIREWORKS_API_KEY",
     "DISCORD_HOME_CHANNEL", "DISCORD_HOME_CHANNEL_NAME",
     "TELEGRAM_HOME_CHANNEL", "TELEGRAM_HOME_CHANNEL_NAME",
     "SLACK_HOME_CHANNEL", "SLACK_HOME_CHANNEL_NAME",

@@ -1109,12 +1109,34 @@ def _generate_elevenlabs(text: str, output_path: str, tts_config: Dict[str, Any]
 
     ElevenLabs = _import_elevenlabs()
     client = ElevenLabs(api_key=api_key)
-    audio_generator = client.text_to_speech.convert(
+
+    # Optional voice settings (stability, similarity_boost, style,
+    # use_speaker_boost, speed) from tts.elevenlabs.voice_settings. Omitted
+    # entirely when unset so prior behaviour (SDK defaults) is preserved.
+    convert_kwargs: Dict[str, Any] = dict(
         text=text,
         voice_id=voice_id,
         model_id=model_id,
         output_format=output_format,
     )
+    vs_config = el_config.get("voice_settings")
+    if vs_config and isinstance(vs_config, dict):
+        try:
+            from elevenlabs import VoiceSettings
+            allowed = {
+                "stability",
+                "similarity_boost",
+                "style",
+                "use_speaker_boost",
+                "speed",
+            }
+            vs_fields = {k: v for k, v in vs_config.items() if k in allowed}
+            if vs_fields:
+                convert_kwargs["voice_settings"] = VoiceSettings(**vs_fields)
+        except ImportError:
+            pass  # older SDK without VoiceSettings — fall back to defaults
+
+    audio_generator = client.text_to_speech.convert(**convert_kwargs)
 
     # audio_generator yields chunks -- write them all
     with open(output_path, "wb") as f:

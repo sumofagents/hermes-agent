@@ -1378,6 +1378,17 @@ def switch_model(
 
     if provider_changed or explicit_provider:
         import os
+        # Long-lived Desktop/gateway processes load ~/.hermes/.env only at
+        # boot. A key added later (e.g. CHEAPESTINFERENCE_API_KEY) is invisible
+        # until reload — without this, user-provider key_env resolution falls
+        # through to the custom "no-key-required" placeholder and remote APIs
+        # return HTTP 401. Mirror classic CLI /reload before reading key_env.
+        try:
+            from hermes_cli.config import reload_env as _reload_env
+
+            _reload_env()
+        except Exception:
+            logger.debug("model switch env reload skipped", exc_info=True)
         # User-config providers (providers.<name> in config.yaml) carry their
         # own base_url + transport + key reference. resolve_runtime_provider()
         # resolves by provider NAME and doesn't know user-config slugs (e.g. a
@@ -1395,10 +1406,27 @@ def switch_model(
             _ukey = str(_ucfg.get("api_key", "") or "").strip()
             if _ukey.startswith("${") and _ukey.endswith("}"):
                 _ukey = os.environ.get(_ukey[2:-1], "").strip()
+            _kenv = str(_ucfg.get("key_env", "") or "").strip()
             if not _ukey:
-                _kenv = str(_ucfg.get("key_env", "") or "").strip()
                 if _kenv:
                     _ukey = os.environ.get(_kenv, "").strip()
+            # Fail closed for configured key_env providers: never substitute the
+            # local "no-key-required" placeholder used by unauthenticated
+            # localhost endpoints. That placeholder produces remote 401s that
+            # look like a broken picker selection.
+            if not _ukey and _kenv:
+                return ModelSwitchResult(
+                    success=False,
+                    target_provider=target_provider,
+                    provider_label=provider_label,
+                    is_global=is_global,
+                    error_message=(
+                        f"Provider '{provider_label}' requires {_kenv}, but that "
+                        f"env var is empty in this process. Add it to "
+                        f"~/.hermes/.env (or Desktop Settings), then run "
+                        f"/reload or restart Hermes Desktop, and try again."
+                    ),
+                )
             try:
                 runtime = resolve_runtime_provider(
                     requested=target_provider,
