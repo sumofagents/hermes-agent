@@ -84,6 +84,8 @@ def create_swarm(
     root_title: Optional[str] = None,
     verifier_title: str = "Verify swarm outputs",
     synthesizer_title: str = "Synthesize swarm outputs",
+    verifier_skills: Optional[list[str]] = None,
+    synthesizer_skills: Optional[list[str]] = None,
     tenant: Optional[str] = None,
     created_by: str = "swarm-orchestrator",
     workspace_kind: str = "scratch",
@@ -189,7 +191,7 @@ def create_swarm(
         priority=priority,
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
-        skills=["requesting-code-review"],
+        skills=verifier_skills or None,
     )
 
     synthesizer_body = (
@@ -208,7 +210,7 @@ def create_swarm(
         priority=priority,
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
-        skills=["humanizer"],
+        skills=synthesizer_skills or None,
     )
 
     created = SwarmCreated(root, worker_ids, verifier, synthesizer)

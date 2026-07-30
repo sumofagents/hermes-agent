@@ -116,13 +116,17 @@ def test_cli_invalid_max_in_progress_silently_disables(isolated_kanban_home, mon
         )
 
 
-def test_kanban_swarm_uses_existing_humanizer_skill():
-    """#29415: kanban_swarm.py used to hardcode skills=['avoid-ai-writing'],
-    a skill that doesn't exist in any registry — synthesizer workers
-    crashed with 'Unknown skill(s): avoid-ai-writing' on every retry.
+def test_kanban_swarm_does_not_hardcode_skills():
+    """#29415 evolution: kanban_swarm.py used to hardcode skills on the
+    verifier and synthesizer cards. First it was 'avoid-ai-writing' (didn't
+    exist), then 'requesting-code-review' + 'humanizer' (don't exist on
+    profiles without those skills installed). Both caused crash loops:
+    'Unknown skill(s): ...' on every dispatch attempt.
 
-    Verify the synthesizer card now uses the bundled 'humanizer' skill
-    which actually exists at skills/creative/humanizer/SKILL.md."""
+    The fix: skills are now caller-supplied via verifier_skills /
+    synthesizer_skills parameters, defaulting to None (no skills). The
+    swarm template must never hardcode a skill name."""
+
     import pathlib
 
     swarm_path = (
@@ -130,21 +134,24 @@ def test_kanban_swarm_uses_existing_humanizer_skill():
         / "hermes_cli" / "kanban_swarm.py"
     )
     src = swarm_path.read_text()
+
+    # Must not contain any hardcoded skill list on verifier or synthesizer.
     assert "avoid-ai-writing" not in src, (
         "kanban_swarm.py must not reference 'avoid-ai-writing' — that "
-        "skill doesn't exist in any registry, crashing synthesizers (#29415)"
+        "skill doesn't exist in any registry (#29415)"
     )
-    assert '"humanizer"' in src, (
-        "kanban_swarm.py should use the bundled 'humanizer' skill for "
-        "synthesizer cards (the original intent of 'avoid-ai-writing')"
+    assert 'skills=["requesting-code-review"]' not in src, (
+        "kanban_swarm.py must not hardcode 'requesting-code-review' on the "
+        "verifier — it doesn't exist on all profiles"
     )
-
-    # And the replacement skill must actually exist on disk.
-    skills_root = (
-        pathlib.Path(__file__).resolve().parent.parent.parent / "skills"
+    assert 'skills=["humanizer"]' not in src, (
+        "kanban_swarm.py must not hardcode 'humanizer' on the synthesizer — "
+        "it doesn't exist on all profiles"
     )
-    humanizer_path = skills_root / "creative" / "humanizer" / "SKILL.md"
-    assert humanizer_path.is_file(), (
-        f"humanizer skill missing at {humanizer_path}; the kanban_swarm fix "
-        "for #29415 requires this bundled skill to exist"
+    # Must use the parameter-driven approach.
+    assert "verifier_skills" in src, (
+        "kanban_swarm.py should accept verifier_skills parameter"
+    )
+    assert "synthesizer_skills" in src, (
+        "kanban_swarm.py should accept synthesizer_skills parameter"
     )
