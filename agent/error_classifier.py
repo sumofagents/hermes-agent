@@ -192,6 +192,14 @@ _OVERLOADED_PATTERNS = [
     "currently overloaded",
     "at capacity",
     "over capacity",
+    # Cheapest Inference / single-seat keys: concurrency is NOT quota exhaustion.
+    # Correct recovery is wait/retry the same key (or queue via
+    # agent.provider_request_queue), never rotate credentials or immediate
+    # fallback to a different provider.
+    "concurrency limit reached",
+    "finish an in-flight request",
+    "too many concurrent requests",
+    "in-flight request and retry",
 ]
 
 # Usage-limit patterns that need disambiguation (could be billing OR rate_limit)
