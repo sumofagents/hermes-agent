@@ -3358,14 +3358,6 @@ def run_conversation(
                 
                 _retry.has_retried_429 = False  # Reset on success
                 _retry.primary_failure_started_at = None  # Success ends any failover-grace streak
-                # Reset fallback position on success: a head-of-line failure
-                # that advanced past fallback_providers[0] (e.g. Fireworks)
-                # must not make the NEXT blip skip straight to a later entry.
-                # Each success means the primary is healthy again, so the next
-                # failure should start the chain from the beginning.
-                if getattr(agent, "_fallback_index", 0) != 0 or getattr(agent, "_fallback_activated", False):
-                    agent._fallback_index = 0
-                    agent._fallback_activated = False
                 # Note: don't clear the retry buffer here — an "API call
                 # success" only means we got bytes back, not that we got
                 # usable content. Empty responses still loop through the
@@ -6047,6 +6039,19 @@ def run_conversation(
                 assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
                 
                 turn_content = assistant_message.content or ""
+
+                # Reset fallback position on a GENUINE response (real content
+                # or tool calls): a head-of-line failure that advanced past
+                # fallback_providers[0] (e.g. Fireworks) must not make the
+                # NEXT blip skip straight to a later entry. Each genuine
+                # response means the provider is healthy again, so the next
+                # failure should start the chain from the beginning. Deliberately
+                # NOT reset on empty responses (they loop through the empty-retry
+                # path later and may still need the full chain).
+                if assistant_message.tool_calls or agent._has_content_after_think_block(turn_content):
+                    if getattr(agent, "_fallback_index", 0) != 0 or getattr(agent, "_fallback_activated", False):
+                        agent._fallback_index = 0
+                        agent._fallback_activated = False
 
                 # Classify tools in this turn to determine if they are all housekeeping.
                 # This classification is needed regardless of whether the turn has visible content,
