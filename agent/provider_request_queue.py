@@ -142,6 +142,34 @@ def resolve_queue_timeout_seconds(
     return float(default)
 
 
+def resolve_failover_grace_seconds(
+    provider: Optional[str],
+    base_url: Optional[str] = None,
+    *,
+    default: float = 0.0,
+) -> float:
+    """Return providers.<slug>.failover_grace_seconds, or ``default``.
+
+    When > 0, the conversation loop keeps retrying the primary provider for
+    that many seconds after the first transient failure before the fallback
+    chain may activate.  Single-concurrency subscription providers (Cheapest
+    Inference) use this so a short 502/429 blip does not dictate an instant
+    jump to a backup model.
+    """
+    pcfg = _load_provider_cfg(provider)
+    raw = pcfg.get("failover_grace_seconds")
+    if raw is None and provider and provider.startswith("custom:"):
+        pcfg = _load_provider_cfg(provider.split(":", 1)[1]) or pcfg
+        raw = pcfg.get("failover_grace_seconds")
+    if raw is None:
+        return float(default)
+    try:
+        val = float(raw)
+        return max(0.0, val)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 def _lock_path(provider: Optional[str], base_url: Optional[str]) -> Path:
     # Stable key shared by custom:cheapest-inference and base_url form
     if _is_default_single_flight(provider, base_url):

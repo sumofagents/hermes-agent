@@ -55,6 +55,36 @@ def test_default_single_flight_for_ci_markers():
     assert resolve_max_concurrent("openai-codex", "https://chatgpt.com/backend-api/codex") == 0
 
 
+def test_failover_grace_seconds_resolution(tmp_path, monkeypatch):
+    import yaml
+    from pathlib import Path as _P
+
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        yaml.safe_dump(
+            {
+                "providers": {
+                    "cheapest-inference": {
+                        "failover_grace_seconds": 60,
+                        "max_concurrent_requests": 1,
+                    }
+                }
+            }
+        )
+    )
+    from hermes_cli import config as hcfg
+
+    # Point _load_provider_cfg's config source at the tmp config.
+    monkeypatch.setattr(hcfg, "load_config", lambda *a, **k: yaml.safe_load(cfg_path.read_text()))
+
+    from agent.provider_request_queue import resolve_failover_grace_seconds
+
+    assert resolve_failover_grace_seconds("custom:cheapest-inference") == 60.0
+    assert resolve_failover_grace_seconds("cheapest-inference") == 60.0
+    # No config for openai-codex -> default 0 (behavior unchanged)
+    assert resolve_failover_grace_seconds("openai-codex") == 0.0
+
+
 def test_cross_thread_slot_serializes(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     # force lock dir under tmp

@@ -279,6 +279,26 @@ def _ra():
     return run_agent
 
 
+def _ra_failover_grace(agent) -> float:
+    """Failover grace window (seconds) for the active provider.
+
+    Reads ``providers.<slug>.failover_grace_seconds``.  When > 0, the retry
+    loop holds the primary for that long after the first transient failure
+    before the fallback chain may activate (single-concurrency subscription
+    keys like Cheapest Inference; a short 502/429 blip must not dictate a
+    provider jump).
+    """
+    try:
+        from agent.provider_request_queue import resolve_failover_grace_seconds
+
+        return resolve_failover_grace_seconds(
+            getattr(agent, "provider", None),
+            getattr(agent, "base_url", None),
+        )
+    except Exception:
+        return 0.0
+
+
 def _nous_entitlement_message(capability: str) -> str:
     try:
         from hermes_cli.nous_account import (
@@ -3337,6 +3357,7 @@ def run_conversation(
                         )
                 
                 _retry.has_retried_429 = False  # Reset on success
+                _retry.primary_failure_started_at = None  # Success ends any failover-grace streak
                 # Note: don't clear the retry buffer here — an "API call
                 # success" only means we got bytes back, not that we got
                 # usable content. Empty responses still loop through the
@@ -4300,9 +4321,40 @@ def run_conversation(
                 )
                 if _is_zai_coding_overload:
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+                # ── Failover grace hold ───────────────────────────────
+                # Single-concurrency subscription providers (Cheapest
+                # Inference) can blip (Cloudflare 502, concurrency 429) for a
+                # few seconds.  Without a hold, the eager-fallback gate below
+                # jumps to a backup provider on the 2nd transport failure —
+                # letting a short outage dictate a provider switch.  When
+                # ``providers.<slug>.failover_grace_seconds`` is set, keep
+                # failing through the queue/backoff on the primary until the
+                # grace window elapses; only then allow fallback.
+                _grace_seconds = _ra_failover_grace(agent)
+                _grace_elapsed = 0.0
+                _failover_allowed = True
+                _grace_hold = False
+                if _grace_seconds > 0.0 and classified.reason is not FailoverReason.billing:
+                    if _retry.primary_failure_started_at is None:
+                        _retry.primary_failure_started_at = time.time()
+                    _grace_elapsed = time.time() - _retry.primary_failure_started_at
+                    if _grace_elapsed < _grace_seconds:
+                        # Raise the retry ceiling so we don't exhaust the
+                        # retry budget (and hit the max-retries fallback path)
+                        # before the grace window closes.
+                        max_retries = max(max_retries, 12)
+                        _failover_allowed = False
+                        _grace_hold = True
+                        _grace_remaining = _grace_seconds - _grace_elapsed
+                        if _grace_remaining > 1.0:
+                            agent._buffer_status(
+                                f"⏳ Holding {_provider} during {_grace_seconds:.0f}s "
+                                f"failover grace ({_grace_elapsed:.0f}s elapsed, "
+                                f"{_grace_remaining:.0f}s left)..."
+                            )
                 _should_fallback = (
-                    is_rate_limited
-                    or (_is_transport_failure and retry_count >= 2)
+                    (is_rate_limited or (_is_transport_failure and retry_count >= 2))
+                    and _failover_allowed
                 )
                 if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
                     # Don't eagerly fallback if credential pool rotation may
@@ -5106,6 +5158,24 @@ def run_conversation(
                     }
 
                 if retry_count >= max_retries:
+                    # ── Failover grace still active? Keep retrying primary ──
+                    # max_retries got raised during the grace window (above),
+                    # but if retries were consumed before the window closes
+                    # (e.g. very fast failures), do NOT fall back yet — hold
+                    # the primary for the remainder of the grace window. This
+                    # prevents a short CI 502/429 blip from exhausting the
+                    # budget and jumping to a backup provider.
+                    if not _failover_allowed:
+                        _grace_remaining = max(0.0, _grace_seconds - (time.time() - _retry.primary_failure_started_at))
+                        if _grace_remaining > 0.0:
+                            agent._buffer_status(
+                                f"⏳ Holding {_provider} during failover grace — "
+                                f"retrying primary in {min(5.0, _grace_remaining):.0f}s "
+                                f"({_grace_remaining:.0f}s left)..."
+                            )
+                            retry_count = 0
+                            time.sleep(min(5.0, _grace_remaining))
+                            continue
                     # Before falling back, try rebuilding the primary
                     # client once for transient transport errors (stale
                     # connection pool, TCP reset).  Only attempted once

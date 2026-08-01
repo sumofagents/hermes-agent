@@ -58,6 +58,12 @@ class TurnRetryState:
     # ── Transport / rate-limit recovery ──────────────────────────────────
     primary_recovery_attempted: bool = False
     has_retried_429: bool = False
+    # Wall-clock time the current primary failure streak started (None until
+    # the first transient error). Combined with
+    # ``providers.<slug>.failover_grace_seconds``, this holds the primary
+    # during a grace window instead of letting a short outage dictate an
+    # instant fallback-provider jump.  Reset on success. (#CI-single-key)
+    primary_failure_started_at: float | None = None
 
     # ── Auth-failure provider failover ───────────────────────────────────
     # Set once we've escalated a persistent 401/403 (after the per-provider
