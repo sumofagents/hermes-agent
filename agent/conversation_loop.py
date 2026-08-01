@@ -3714,8 +3714,9 @@ def run_conversation(
                 _ctx_len = getattr(_compressor, "context_length", 200000) if _compressor else 200000
                 classified = classify_api_error(
                     api_error,
-                    provider=getattr(agent, "provider", "") or "",
-                    model=getattr(agent, "model", "") or "",
+                    provider=_provider,
+                    model=_model,
+                    base_url=str(_base),
                     approx_tokens=approx_tokens,
                     context_length=_ctx_len,
                     num_messages=len(api_messages) if api_messages else 0,

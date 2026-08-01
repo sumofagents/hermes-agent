@@ -607,6 +607,7 @@ def classify_api_error(
     *,
     provider: str = "",
     model: str = "",
+    base_url: str = "",
     approx_tokens: int = 0,
     context_length: int = 200000,
     num_messages: int = 0,
@@ -614,19 +615,21 @@ def classify_api_error(
     """Classify an API error into a structured recovery recommendation.
 
     Priority-ordered pipeline:
-      1. Special-case provider-specific patterns (thinking sigs, tier gates)
-      2. HTTP status code + message-aware refinement
-      3. Error code classification (from body)
-      4. Message pattern matching (billing vs rate_limit vs context vs auth)
-      5. SSL/TLS transient alert patterns → retry as timeout
-      6. Server disconnect + large session → context overflow
-      7. Transport error heuristics
-      8. Fallback: unknown (retryable with backoff)
+     1. Special-case provider-specific patterns (thinking sigs, tier gates)
+     2. HTTP status code + message-aware refinement
+     3. Error code classification (from body)
+     4. Message pattern matching (billing vs rate_limit vs context vs auth)
+     5. SSL/TLS transient alert patterns → retry as timeout
+     6. Server disconnect + large session → context overflow
+     7. Transport error heuristics
+     8. Fallback: unknown (retryable with backoff)
 
     Args:
         error: The exception from the API call.
         provider: Current provider name (e.g. "openrouter", "anthropic").
         model: Current model slug.
+        base_url: Current endpoint base URL (used to disambiguate aggregate /
+            single-concurrency providers that send ambiguous status codes).
         approx_tokens: Approximate token count of the current context.
         context_length: Maximum context length for the current model.
 
@@ -837,6 +840,7 @@ def classify_api_error(
         classified = _classify_by_status(
             status_code, error_msg, error_code, body,
             provider=provider_lower, model=model_lower,
+            base_url=base_url,
             approx_tokens=approx_tokens, context_length=context_length,
             num_messages=num_messages,
             result_fn=_result,
@@ -980,6 +984,7 @@ def _classify_by_status(
     *,
     provider: str,
     model: str,
+    base_url: str = "",
     approx_tokens: int,
     context_length: int,
     num_messages: int = 0,
@@ -1001,6 +1006,23 @@ def _classify_by_status(
         )
 
     if status_code == 403:
+        # Cheapest Inference (single-concurrency subscription) intermittently
+        # returns a 403 "Invalid or expired API key" for a VALID key under
+        # load / through their edge cache; the same key succeeds on the very
+        # next request and on direct probes.  Treat that as transient
+        # (overloaded-class) so the failover-grace hold + queue retry can
+        # pass, and do NOT mark the credential exhausted/poison the pool.
+        if (
+            "cheapestinference.com" in (base_url or "").lower()
+            and "invalid or expired api key" in error_msg
+            and "authentication_error" in str(error_code).lower()
+        ):
+            return result_fn(
+                FailoverReason.overloaded,
+                retryable=True,
+                should_rotate_credential=False,
+                should_fallback=False,
+            )
         # OpenRouter 403 "key limit exceeded" is actually billing. Other
         # providers also use 403 for account-plan or credit exhaustion.
         if (

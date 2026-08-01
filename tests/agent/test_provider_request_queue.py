@@ -40,6 +40,36 @@ def test_ci_concurrency_429_is_overloaded_not_immediate_fallback():
     assert classified.should_rotate_credential is False
 
 
+def test_ci_invalid_key_403_transient_not_pool_poison():
+    """CI intermittently 403s a VALID single-concurrency key under load.
+
+    Must classify as transient overload (grace/queue retry, no pool
+    exhaustion) instead of auth/non-retryable that marks the key exhausted
+    and jumps to fallback.
+    """
+    err = _FakeErr(
+        403,
+        "Invalid or expired API key.",
+        code="authentication_error",
+    )
+    # With base_url present -> transient overload, no rotation, no fallback
+    classified = classify_api_error(
+        err,
+        provider="custom",
+        model="kimi-k3",
+        base_url="https://api.cheapestinference.com/v1",
+    )
+    assert classified.reason == FailoverReason.overloaded
+    assert classified.retryable is True
+    assert classified.should_rotate_credential is False
+    assert classified.should_fallback is False
+    # Without base_url (e.g. auxiliary path that didn't pass it) -> keep old
+    # auth classification so a truly dead key still fails fast.
+    classified2 = classify_api_error(err, provider="custom", model="kimi-k3")
+    assert classified2.reason == FailoverReason.auth
+    assert classified2.retryable is False
+
+
 def test_ci_daily_window_429_still_rate_limit_fallback():
     err = _FakeErr(
         429,
