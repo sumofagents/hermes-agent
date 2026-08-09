@@ -29,6 +29,7 @@ Optional hooks (override to opt in):
   on_memory_write(action, target, content, metadata=None) — mirror built-in memory writes
   on_delegation(task, result, **kwargs)  — parent-side observation of subagent work
   backup_paths() -> list[str]            — extra on-disk paths to include in `hermes backup`
+  post_query_rerank(query, rows)         — optionally rerank candidates after vector search
 """
 
 from __future__ import annotations
@@ -349,3 +350,25 @@ class MemoryProvider(ABC):
         from config/env only. Default returns an empty list (nothing external).
         """
         return []
+
+    def post_query_rerank(
+        self, query: str, rows: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Optionally rerank raw query rows before formatting for recall.
+
+        Called inside a provider's own query/search methods (where raw
+        candidate rows exist), NOT by the core loop — the core never sees
+        rows, only the formatted prefetch string injected into the USER
+        message. Default returns rows unchanged.
+
+        A reference implementation using Fisher-Rao geometry on a
+        categorical probability simplex is available at
+        ``plugins/memory/md_reranker.py``. It is pure stdlib, embedding-
+        agnostic, and requires no model calls or training data. See
+        Thompson & Horowitz, "Manifold Destiny" (2026) for the theory.
+
+        Implementations must operate only on the recall (user-message)
+        path, never the system-prompt/generated-profile path, to preserve
+        the cached prefix.
+        """
+        return rows
